@@ -1,0 +1,25 @@
+[package]
+name = "omascripture"
+version = "0.2.0"
+edition = "2024"
+description = "Read and study the Bible in your terminal, built for Omarchy"
+license = "MIT"
+readme = "README.md"
+keywords = ["bible", "tui", "omarchy", "scripture"]
+categories = ["command-line-utilities"]
+
+[profile.release]
+lto = true
+codegen-units = 1
+strip = true
+
+[dependencies]
+crossterm = "0.29.0"
+dirs = "7.0.0"
+flate2 = "1.1.10"
+ratatui = "0.30.2"
+serde = { version = "1.0.229", features = ["derive"] }
+serde_json = "1.0.151"
+unicode-width = "0.2.2"
+ureq = { version = "3.4.1", default-features = false, features = ["rustls"] }
+zip = { version = "8.6.0", default-features = false, features = ["deflate"] }
