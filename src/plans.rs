@@ -73,7 +73,7 @@ pub fn today() -> i64 {
 
 /// Civil date (y, m, d) from days since epoch. Howard Hinnant's algorithm.
 pub fn civil_from_days(z: i64) -> (i64, u32, u32) {
-    let z = z + 719_468;
+    let z = z.saturating_add(719_468);
     let era = z.div_euclid(146_097);
     let doe = z.rem_euclid(146_097);
     let yoe = (doe - doe / 1460 + doe / 36_524 - doe / 146_096) / 365;
@@ -97,7 +97,7 @@ impl Progress {
 
     /// The plan day (0-based) that the calendar says is today.
     pub fn current_day(&self) -> usize {
-        (today() - self.start_day).max(0) as usize
+        today().saturating_sub(self.start_day).max(0) as usize
     }
 
     pub fn days(&self) -> usize {
@@ -113,6 +113,15 @@ impl Progress {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn extreme_saved_plan_dates_do_not_overflow() {
+        for start_day in [i64::MIN, i64::MAX] {
+            let p = Progress { id: "bible-365".into(), start_day, done: BTreeSet::new() };
+            assert!(!format_day(start_day).is_empty());
+            assert!(p.behind() <= 365);
+        }
+    }
 
     #[test]
     fn plans_cover_everything() {

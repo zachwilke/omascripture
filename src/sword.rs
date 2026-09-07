@@ -19,7 +19,9 @@ fn u16_at(b: &[u8], i: usize) -> u16 {
 
 fn inflate(data: &[u8]) -> io::Result<Vec<u8>> {
     let mut out = Vec::new();
-    ZlibDecoder::new(data).read_to_end(&mut out)?;
+    const MAX_BLOCK: u64 = 64 * 1024 * 1024;
+    ZlibDecoder::new(data).take(MAX_BLOCK + 1).read_to_end(&mut out)?;
+    if out.len() as u64 > MAX_BLOCK { return Err(io::Error::new(io::ErrorKind::InvalidData, "SWORD block exceeds size limit")); }
     Ok(out)
 }
 
@@ -285,13 +287,17 @@ impl Dictionary {
             let entry = *b as usize;
             let mut cache = self.cache.borrow_mut();
             if cache.as_ref().map(|(bl, _)| *bl != block).unwrap_or(true) {
-                let zo = u32_at(&self.zdx, block as usize * 8) as usize;
-                let zs = u32_at(&self.zdx, block as usize * 8 + 4) as usize;
+                let offset = (block as usize).checked_mul(8)?;
+                self.zdx.get(offset..offset.checked_add(8)?)?;
+                let zo = u32_at(&self.zdx, offset) as usize;
+                let zs = u32_at(&self.zdx, offset + 4) as usize;
                 let data = inflate(self.zdt.get(zo..zo + zs)?).ok()?;
                 *cache = Some((block, data));
             }
             let data = &cache.as_ref().unwrap().1;
+            data.get(..4)?;
             let count = u32_at(data, 0) as usize;
+            data.get(..4usize.checked_add(count.checked_mul(8)?)?)?;
             if entry >= count {
                 return None;
             }
@@ -299,7 +305,7 @@ impl Dictionary {
             let es = u32_at(data, 4 + entry * 8 + 4) as usize;
             String::from_utf8_lossy(data.get(eo..eo + es)?).into_owned()
         } else {
-            String::from_utf8_lossy(self.dat.get(*a as usize..(*a + *b) as usize)?).into_owned()
+            String::from_utf8_lossy(self.dat.get(*a as usize..(*a as usize).checked_add(*b as usize)?)?).into_owned()
         };
         Some(strip_markup(&raw))
     }
@@ -323,16 +329,12 @@ pub fn strip_markup(raw: &str) -> String {
             match name.as_str() {
                 "br" | "lb" | "l" => out.push('\n'),
                 "p" | "div" | "list" | "item" | "lg" | "milestone" => {
-                    if closing || name == "milestone" {
-                        out.push('\n');
-                    } else if !out.ends_with('\n') && !out.is_empty() {
+                    if closing || name == "milestone" || (!out.ends_with('\n') && !out.is_empty()) {
                         out.push('\n');
                     }
                 }
                 "title" | "head" => {
-                    if closing {
-                        out.push('\n');
-                    } else if !out.is_empty() && !out.ends_with('\n') {
+                    if closing || (!out.is_empty() && !out.ends_with('\n')) {
                         out.push('\n');
                     }
                 }
@@ -424,6 +426,21 @@ fn decode_entity(e: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn damaged_dictionary_blocks_return_none_instead_of_panicking() {
+        let mut dictionary = Dictionary { keys: vec![("word".into(), u32::MAX, 0)], zld: true, dat: vec![], zdx: vec![], zdt: vec![], cache: RefCell::new(None) };
+        assert!(dictionary.entry("word").is_none());
+        dictionary.keys[0].1 = 0;
+        *dictionary.cache.borrow_mut() = Some((0, vec![1, 0, 0, 0]));
+        assert!(dictionary.entry("word").is_none());
+        *dictionary.cache.borrow_mut() = Some((0, vec![]));
+        assert!(dictionary.entry("word").is_none());
+        dictionary.zld = false;
+        dictionary.keys[0].1 = u32::MAX;
+        dictionary.keys[0].2 = u32::MAX;
+        assert!(dictionary.entry("word").is_none());
+    }
 
     #[test]
     fn indexes_match_layout() {

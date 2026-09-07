@@ -1,23 +1,30 @@
 mod app;
 mod bible;
+mod gui;
+mod gui_theme;
 mod harmony;
+mod menu;
 mod plans;
+mod providers;
 mod resources;
+mod settings;
 mod study;
+mod storage;
 mod sword;
 mod ui;
 mod v11n;
 mod votd;
+mod word_data;
 
 use app::App;
-use crossterm::event::{self, Event, KeyEventKind};
+use crossterm::event::{self, DisableMouseCapture, EnableMouseCapture, Event, KeyEventKind};
 use std::time::Duration;
 
 const VERSION: &str = env!("CARGO_PKG_VERSION");
 
 fn usage() {
     println!(
-        "OmaScripture {VERSION} — read and study the Bible in your terminal
+        "OmaScripture {VERSION} — read and study the Bible on your desktop
 
 USAGE:
     omascripture [OPTIONS] [REFERENCE]
@@ -26,6 +33,8 @@ ARGS:
     REFERENCE                 Open at a reference, e.g. \"John 3:16\", \"Ps 23\", \"1 Jn 2\"
 
 OPTIONS:
+    --gui                     Open the desktop app (default)
+    --tui                     Use the optional terminal interface
     -t, --translation <ID>    Use this translation (e.g. kjv, web, asv)
     -d, --download <ID>       Download a translation and exit
     -l, --list                List downloaded translations and exit
@@ -33,6 +42,9 @@ OPTIONS:
     -r, --resources           List study resource packs (commentaries, lexicons, ...) and exit
     -i, --install <ID>        Download a study resource pack and exit (repeatable)
     -x, --remove <ID>         Remove a study resource pack and exit
+    --providers               Show online providers and configuration status
+    --init-providers          Create a private provider configuration template
+    --api-bibles              List Bible IDs authorized for your API.Bible key
     --votd                    Print the verse of the day and exit
     --votd-bar                Print the verse of the day as Omarchy bar JSON and exit
     -h, --help                Show this help
@@ -45,10 +57,55 @@ Data directory: {}",
 
 fn main() {
     let mut args = std::env::args().skip(1);
+    let mut tui = false;
     let mut translation: Option<String> = None;
     let mut reference_parts: Vec<String> = Vec::new();
     while let Some(a) = args.next() {
         match a.as_str() {
+            "--tui" => tui = true,
+            "--gui" => tui = false,
+            "--providers" => {
+                println!("Config: {}", providers::config_path().display());
+                if let Err(e) = providers::config() {
+                    eprintln!("{e}");
+                    std::process::exit(1);
+                }
+                for p in providers::catalog() {
+                    println!(
+                        "{:<32} {:<30} {}",
+                        p.abbreviation,
+                        p.translation,
+                        providers::status(&p.abbreviation)
+                    );
+                }
+                return;
+            }
+            "--init-providers" => {
+                match providers::init_config() {
+                    Ok(path) => {
+                        println!("Edit {} to add provider keys (see README)", path.display())
+                    }
+                    Err(e) => {
+                        eprintln!("{e}");
+                        std::process::exit(1);
+                    }
+                }
+                return;
+            }
+            "--api-bibles" => {
+                match providers::available_api_bibles() {
+                    Ok(list) => {
+                        for (id, name) in list {
+                            println!("{id}  {name}");
+                        }
+                    }
+                    Err(e) => {
+                        eprintln!("{e}");
+                        std::process::exit(1);
+                    }
+                }
+                return;
+            }
             "-h" | "--help" => {
                 usage();
                 return;
@@ -60,25 +117,40 @@ fn main() {
             "-l" | "--list" => {
                 let list = bible::installed();
                 if list.is_empty() {
-                    println!("No translations downloaded yet. Run `omascripture -d kjv` or pick one in the app.");
+                    println!(
+                        "No translations downloaded yet. Run `omascripture -d kjv` or pick one in the app."
+                    );
                 }
                 for t in list {
-                    println!("{:<10} {:<40} {}", t.abbreviation, t.translation, t.language);
+                    println!(
+                        "{:<10} {:<40} {}",
+                        t.abbreviation, t.translation, t.language
+                    );
                 }
                 return;
             }
-            "-c" | "--catalog" => match bible::fetch_catalog() {
-                Ok(list) => {
-                    for t in list {
-                        let mark = if bible::is_installed(&t.abbreviation) { "*" } else { " " };
-                        println!("{mark} {:<14} {:<50} {}", t.abbreviation, t.translation, t.language);
+            "-c" | "--catalog" => {
+                match bible::fetch_catalog() {
+                    Ok(list) => {
+                        for t in list {
+                            let mark = if bible::is_installed(&t.abbreviation) {
+                                "*"
+                            } else {
+                                " "
+                            };
+                            println!(
+                                "{mark} {:<14} {:<50} {}",
+                                t.abbreviation, t.translation, t.language
+                            );
+                        }
+                    }
+                    Err(e) => {
+                        eprintln!("Could not fetch catalog: {e}");
+                        std::process::exit(1);
                     }
                 }
-                Err(e) => {
-                    eprintln!("Could not fetch catalog: {e}");
-                    std::process::exit(1);
-                }
-            },
+                return;
+            }
             "-d" | "--download" => {
                 let Some(id) = args.next() else {
                     eprintln!("--download needs a translation id");
@@ -96,8 +168,19 @@ fn main() {
             }
             "-r" | "--resources" => {
                 for p in resources::PACKS {
-                    let mark = if resources::is_installed(p.id) { "*" } else { " " };
-                    println!("{mark} {:<16} {:<44} {:<14} {:<7} {}", p.id, p.name, p.kind.label(), p.size, p.license);
+                    let mark = if resources::is_installed(p.id) {
+                        "*"
+                    } else {
+                        " "
+                    };
+                    println!(
+                        "{mark} {:<16} {:<44} {:<14} {:<7} {}",
+                        p.id,
+                        p.name,
+                        p.kind.label(),
+                        p.size,
+                        p.license
+                    );
                 }
                 println!("\n* = installed. Install with: omascripture --install <id>");
                 return;
@@ -107,7 +190,11 @@ fn main() {
                     eprintln!("--install needs a resource id (see --resources)");
                     std::process::exit(2);
                 };
-                let ids: Vec<String> = if id == "all" { resources::PACKS.iter().map(|p| p.id.to_string()).collect() } else { vec![id] };
+                let ids: Vec<String> = if id == "all" {
+                    resources::PACKS.iter().map(|p| p.id.to_string()).collect()
+                } else {
+                    vec![id]
+                };
                 for id in ids {
                     if resources::is_installed(&id) {
                         eprintln!("{id}: already installed");
@@ -148,15 +235,32 @@ fn main() {
             _ => reference_parts.push(a),
         }
     }
-    let reference = if reference_parts.is_empty() { None } else { Some(reference_parts.join(" ")) };
+    let reference = if reference_parts.is_empty() {
+        None
+    } else {
+        Some(reference_parts.join(" "))
+    };
 
     let mut app = App::new();
     app.start(translation, reference);
 
+    if !tui {
+        if let Err(e) = gui::run(app) {
+            eprintln!("Could not open OmaScripture: {e}");
+            std::process::exit(1);
+        }
+        return;
+    }
+
     let mut terminal = ratatui::init();
+    let _ = crossterm::execute!(std::io::stdout(), EnableMouseCapture);
     let result = run(&mut terminal, &mut app);
+    let _ = crossterm::execute!(std::io::stdout(), DisableMouseCapture);
     ratatui::restore();
-    app.save();
+    if !app.save() {
+        eprintln!("{}", app.save_error.as_deref().unwrap_or("Study save failed"));
+        if let Ok(path) = app.study.export_recovery() { eprintln!("Recovery copy: {}", path.display()); }
+    }
     if let Err(e) = result {
         eprintln!("error: {e}");
         std::process::exit(1);
@@ -170,27 +274,49 @@ fn print_votd(bar: bool, translation: Option<String>) {
         .or_else(|| bible::installed().first().map(|i| i.abbreviation.clone()));
     let Some(abbr) = abbr else {
         if bar {
-            println!("{{\"text\":\"󰂺 OmaScripture\",\"tooltip\":\"No translation downloaded yet\"}}");
+            println!(
+                "{{\"text\":\"󰂺 OmaScripture\",\"tooltip\":\"No translation downloaded yet\"}}"
+            );
         } else {
             eprintln!("No translation downloaded yet.");
         }
         return;
     };
-    let Ok(t) = bible::load(&abbr) else {
+    let result = if providers::is_online(&abbr) {
+        providers::open(&abbr)
+    } else {
+        bible::load(&abbr).map_err(|e| e.to_string())
+    };
+    let Ok(t) = result else {
         eprintln!("Could not load translation {abbr}");
         return;
     };
-    let Some((loc, _)) = votd::today(&t) else { return };
+    let Some((loc, _)) = votd::today(&t) else {
+        return;
+    };
     let reference = t.reference(loc);
-    let text = t.verse_text(loc).unwrap_or("").to_string();
+    let text = if t.online.is_some() {
+        match providers::fetch(&abbr, loc.book, loc.chapter) {
+            Ok(p) => {
+                let number = t.position_from_loc(loc).verse;
+                let Some(v) = p.verses.iter().find(|v| v.verse == number) else {
+                    eprintln!("Provider did not return the requested verse");
+                    return;
+                };
+                format!("{}\n{}", v.text, p.notice)
+            }
+            Err(e) => {
+                eprintln!("{e}");
+                return;
+            }
+        }
+    } else {
+        t.verse_text(loc).unwrap_or("").to_string()
+    };
     if bar {
-        let esc = |s: &str| s.replace('\\', "\\\\").replace('"', "\\\"");
         println!(
-            "{{\"text\":\"󰂺 {}\",\"tooltip\":\"{} ({})\\n{}\"}}",
-            esc(&reference),
-            esc(&reference),
-            t.abbreviation.to_uppercase(),
-            esc(&text)
+            "{}",
+            serde_json::json!({"text": format!("󰂺 {reference}"), "tooltip": format!("{} ({})\n{}", reference, t.abbreviation.to_uppercase(), text)})
         );
     } else {
         println!("{reference} ({})\n{text}", t.abbreviation.to_uppercase());
@@ -203,6 +329,7 @@ fn run(terminal: &mut ratatui::DefaultTerminal, app: &mut App) -> std::io::Resul
         if event::poll(Duration::from_millis(150))? {
             match event::read()? {
                 Event::Key(key) if key.kind != KeyEventKind::Release => app.handle_key(key),
+                Event::Mouse(m) => app.handle_mouse(m),
                 Event::Resize(_, _) => {}
                 _ => {}
             }

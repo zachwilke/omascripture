@@ -1,12 +1,16 @@
 //! Application state and key handling.
 
+use crate::providers;
+
 use crate::bible::{self, Loc, Position, SearchHit, Translation, TranslationInfo};
 use crate::harmony;
+use crate::menu::{self, MENUS};
 use crate::plans;
 use crate::resources::{self, LexEntry, Store, Word};
 use crate::study::{HIGHLIGHT_NAMES, Study};
 use crate::votd;
-use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+use crossterm::event::{KeyCode, KeyEvent, KeyModifiers, MouseButton, MouseEvent, MouseEventKind};
+use ratatui::layout::Rect;
 use std::io::Write;
 use std::process::{Command, Stdio};
 use std::sync::mpsc::{self, Receiver, Sender};
@@ -35,6 +39,56 @@ pub enum Mode {
     DictEntry,
     WordStudy,
     Occurrences,
+    Menu,
+    Settings,
+}
+
+/// A region of the screen the mouse can scroll.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ScrollArea {
+    Main,
+    Parallel,
+    Side,
+    List,
+    Text,
+    Chapters,
+}
+
+/// What a click on a recorded region does.
+#[derive(Debug, Clone)]
+pub enum Action {
+    /// Press a key in the current mode.
+    Key(KeyCode, KeyModifiers),
+    /// Select a verse in the reading pane.
+    Verse(Position),
+    /// Click on empty reading-pane space: focus the text.
+    FocusMain,
+    /// Click on sidebar body: focus the sidebar.
+    FocusSide,
+    Tab(u8),
+    /// Sidebar item: select and open.
+    SideItem(usize),
+    /// List item: select; a second click (or double-click) opens it.
+    Select(usize),
+    /// List item: select and open at once.
+    Open(usize),
+    Chapter(usize),
+    Menu(usize),
+    MenuItem(usize),
+    /// Settings row: select it and move its value forward or back.
+    Adjust(usize, i8),
+    Scroll(ScrollArea),
+    /// Click outside a popup: same as Esc.
+    Dismiss,
+    /// Swallow the click (popup body).
+    None,
+}
+
+/// A clickable region recorded while drawing.
+#[derive(Debug, Clone)]
+pub struct Hit {
+    pub rect: Rect,
+    pub action: Action,
 }
 
 /// Which slot a translation picker selection applies to.
@@ -46,9 +100,24 @@ pub enum Slot {
 
 /// Messages from background worker threads.
 pub enum Msg {
+    Chapter {
+        id: String,
+        slot: Slot,
+        book: usize,
+        chapter: usize,
+        result: Result<providers::Passage, String>,
+    },
     Catalog(Result<Vec<TranslationInfo>, String>),
-    Loaded { abbr: String, slot: Slot, result: Result<Translation, String> },
-    Installed { id: String, result: Result<(), String> },
+    Loaded {
+        generation: u64,
+        abbr: String,
+        slot: Slot,
+        result: Result<Translation, String>,
+    },
+    Installed {
+        id: String,
+        result: Result<(), String>,
+    },
 }
 
 #[derive(Default)]
@@ -106,10 +175,16 @@ pub struct App {
     pub study: Study,
     pub main_pane: Pane,
     pub side_pane: Pane,
-    pub history: Vec<Loc>,
+    pub history: Vec<Position>,
     pub status: Option<(String, Instant)>,
     pub busy: Option<String>,
     pub should_quit: bool,
+    pub save_error: Option<String>,
+    last_checkpoint: Instant,
+    load_generation: u64,
+    load_pending: [Option<u64>; 2],
+    install_pending: bool,
+    catalog_pending: bool,
 
     // pickers
     pub filter: String,
@@ -148,13 +223,27 @@ pub struct App {
     // study popups
     pub harmony_items: Vec<HarmonyItem>,
     pub dict_results: Vec<(String, String, String)>, // (source id, source name, key)
-    pub dict_entry: Option<(String, String)>,       // (title, body)
+    pub dict_entry: Option<(String, String)>,        // (title, body)
     pub word_study: Option<WordStudy>,
     pub plan_day: Option<usize>,
     pub install_all: bool,
 
+    // mouse
+    pub hits: Vec<Hit>,
+    pub menu: usize,
+    /// Mode to return to after the translation picker (settings page).
+    pub return_to: Option<Mode>,
+    first_load: bool,
+    chapter_pending: [bool; 2],
+
     tx: Sender<Msg>,
     rx: Receiver<Msg>,
+}
+
+fn worker<T>(work: impl FnOnce() -> Result<T, String>) -> Result<T, String> {
+    std::panic::catch_unwind(std::panic::AssertUnwindSafe(work)).unwrap_or_else(|_| {
+        Err("Background operation failed unexpectedly. Please try again.".into())
+    })
 }
 
 impl App {
@@ -166,8 +255,17 @@ impl App {
             translation: None,
             parallel: None,
             parallel_visible: false,
-            loc: Loc { book: 0, chapter: 0, verse: 0 },
-            sidebar: study.sidebar.min(4),
+            loc: Loc {
+                book: 0,
+                chapter: 0,
+                verse: 0,
+            },
+            sidebar: match study.sidebar_start.as_str() {
+                "hidden" => 0,
+                "shown" => study.sidebar.clamp(1, 4),
+                _ if study.sidebar_visible.unwrap_or(study.sidebar != 0) => study.sidebar.min(4),
+                _ => 0,
+            },
             study,
             main_pane: Pane::default(),
             side_pane: Pane::default(),
@@ -175,6 +273,12 @@ impl App {
             status: None,
             busy: None,
             should_quit: false,
+            save_error: None,
+            last_checkpoint: Instant::now(),
+            load_generation: 0,
+            load_pending: [None; 2],
+            install_pending: false,
+            catalog_pending: false,
             filter: String::new(),
             list_index: 0,
             catalog: bible::cached_catalog(),
@@ -201,6 +305,11 @@ impl App {
             word_study: None,
             plan_day: None,
             install_all: false,
+            hits: Vec::new(),
+            menu: 0,
+            return_to: None,
+            first_load: true,
+            chapter_pending: [false; 2],
             tx,
             rx,
         }
@@ -213,23 +322,25 @@ impl App {
             .or_else(|| self.installed.first().map(|i| i.abbreviation.clone()));
         self.parallel_visible = self.study.parallel_visible;
         match abbr {
-            Some(a) if bible::is_installed(&a) => {
+            Some(a) if bible::is_installed(&a) || providers::is_online(&a) => {
                 self.busy = Some(format!("Loading {}…", a.to_uppercase()));
                 self.spawn_load(a, Slot::Primary);
             }
             Some(a) => {
-                self.set_status(format!("Translation '{a}' is not installed. Pick one to download."));
+                self.set_status(format!(
+                    "Translation '{a}' is not installed. Pick one to download."
+                ));
                 self.open_translations(Slot::Primary);
             }
             None => {
-                self.set_status("Welcome! Pick a translation to download (Enter).".to_string());
+                self.set_status("Welcome! Choose a Bible to start reading.".to_string());
                 self.open_translations(Slot::Primary);
             }
         }
-        if let Some(p) = self.study.parallel.clone() {
-            if bible::is_installed(&p) {
-                self.spawn_load(p, Slot::Parallel);
-            }
+        if let Some(p) = self.study.parallel.clone()
+            && (bible::is_installed(&p) || providers::is_online(&p))
+        {
+            self.spawn_load(p, Slot::Parallel);
         }
         self.pending_reference = reference;
         if self.catalog.is_empty() {
@@ -242,65 +353,134 @@ impl App {
     // ---------------------------------------------------------------------
 
     pub fn refresh_catalog(&mut self) {
+        if self.catalog_pending {
+            return;
+        }
+        self.catalog_pending = true;
         let tx = self.tx.clone();
         thread::spawn(move || {
-            let _ = tx.send(Msg::Catalog(bible::fetch_catalog()));
+            let _ = tx.send(Msg::Catalog(worker(bible::fetch_catalog)));
         });
     }
 
+    fn begin_load(&mut self, slot: Slot) -> u64 {
+        self.load_generation += 1;
+        self.load_pending[if slot == Slot::Primary { 0 } else { 1 }] = Some(self.load_generation);
+        self.load_generation
+    }
+
+    pub fn cancel_parallel_load(&mut self) {
+        self.load_pending[1] = None;
+        self.clear_finished_busy();
+    }
+
+    fn clear_finished_busy(&mut self) {
+        if self.load_pending.iter().all(Option::is_none) && !self.install_pending {
+            self.busy = None;
+        }
+    }
+
     fn spawn_load(&mut self, abbr: String, slot: Slot) {
+        let generation = self.begin_load(slot);
         let tx = self.tx.clone();
         thread::spawn(move || {
-            let result = bible::load(&abbr).map_err(|e| e.to_string());
-            let _ = tx.send(Msg::Loaded { abbr, slot, result });
+            let result = worker(|| {
+                if providers::is_online(&abbr) {
+                    providers::open(&abbr)
+                } else {
+                    bible::load(&abbr).map_err(|e| e.to_string())
+                }
+            });
+            let _ = tx.send(Msg::Loaded {
+                generation,
+                abbr,
+                slot,
+                result,
+            });
         });
     }
 
     fn spawn_download(&mut self, abbr: String, slot: Slot) {
+        let generation = self.begin_load(slot);
         self.busy = Some(format!("Downloading {}…", abbr.to_uppercase()));
         let tx = self.tx.clone();
         thread::spawn(move || {
-            let result = bible::download(&abbr);
-            let _ = tx.send(Msg::Loaded { abbr, slot, result });
+            let result = worker(|| bible::download(&abbr));
+            let _ = tx.send(Msg::Loaded {
+                generation,
+                abbr,
+                slot,
+                result,
+            });
         });
     }
 
     fn spawn_install(&mut self, id: String) {
+        self.install_pending = true;
         let name = resources::pack(&id).map(|p| p.name).unwrap_or("resource");
         self.busy = Some(format!("Downloading {name}…"));
         let tx = self.tx.clone();
         thread::spawn(move || {
-            let result = resources::install(&id);
+            let result = worker(|| resources::install(&id));
             let _ = tx.send(Msg::Installed { id, result });
         });
     }
 
     /// Drain worker messages. Returns true if anything changed.
+    pub fn background_work_pending(&self) -> bool {
+        self.catalog_pending || self.install_pending
+            || self.load_pending.iter().any(Option::is_some)
+            || self.chapter_pending.iter().any(|pending| *pending)
+    }
+
     pub fn poll_messages(&mut self) -> bool {
         let mut changed = false;
         while let Ok(msg) = self.rx.try_recv() {
             changed = true;
             match msg {
+                Msg::Chapter {
+                    id,
+                    slot,
+                    book,
+                    chapter,
+                    result,
+                } => {
+                    self.chapter_pending[if slot == Slot::Primary { 0 } else { 1 }] = false;
+                    self.accept_chapter(&id, slot, book, chapter, result);
+                }
                 Msg::Catalog(Ok(list)) => {
+                    self.catalog_pending = false;
                     self.catalog = list;
                     if self.mode == Mode::Translations {
                         self.set_status(format!("{} translations available", self.catalog.len()));
                     }
                 }
                 Msg::Catalog(Err(e)) => {
+                    self.catalog_pending = false;
                     if self.catalog.is_empty() {
                         self.set_status(format!("Could not fetch translation list: {e}"));
                     }
                 }
-                Msg::Loaded { abbr, slot, result } => {
-                    self.busy = None;
+                Msg::Loaded {
+                    generation,
+                    abbr,
+                    slot,
+                    result,
+                } => {
+                    let index = if slot == Slot::Primary { 0 } else { 1 };
+                    if self.load_pending[index] != Some(generation) {
+                        continue;
+                    }
+                    self.load_pending[index] = None;
+                    self.clear_finished_busy();
                     match result {
                         Ok(t) => self.install_translation(t, slot),
                         Err(e) => self.set_status(format!("Failed to load {abbr}: {e}")),
                     }
                 }
                 Msg::Installed { id, result } => {
-                    self.busy = None;
+                    self.install_pending = false;
+                    self.clear_finished_busy();
                     match result {
                         Ok(()) => {
                             let name = resources::pack(&id).map(|p| p.name).unwrap_or("resource");
@@ -312,10 +492,13 @@ impl App {
                                 .unwrap_or(false);
                             if self.study.commentary.is_none() && is_commentary {
                                 self.study.commentary = Some(id.clone());
-                                let _ = self.study.save();
+                                self.save();
                             }
                             if self.install_all {
-                                match resources::PACKS.iter().find(|p| !resources::is_installed(p.id)) {
+                                match resources::PACKS
+                                    .iter()
+                                    .find(|p| !resources::is_installed(p.id))
+                                {
                                     Some(p) => self.spawn_install(p.id.to_string()),
                                     None => {
                                         self.install_all = false;
@@ -332,42 +515,181 @@ impl App {
                 }
             }
         }
+        self.ensure_online_chapters();
+        if self.last_checkpoint.elapsed() >= Duration::from_secs(3) {
+            self.last_checkpoint = Instant::now();
+            if self.translation.is_some() {
+                self.save();
+            }
+        }
         changed
+    }
+
+    fn online_target(&self, slot: Slot) -> Option<(String, usize, usize)> {
+        let primary = self.translation.as_ref()?;
+        let (t, loc) = if slot == Slot::Primary {
+            (primary, self.loc)
+        } else {
+            if !self.parallel_visible {
+                return None;
+            }
+            let t = self.parallel.as_ref()?;
+            (t, t.loc_from_position(primary.position_from_loc(self.loc))?)
+        };
+        t.online.as_ref()?;
+        Some((t.abbreviation.clone(), loc.book, loc.chapter))
+    }
+
+    fn ensure_online_chapters(&mut self) {
+        for (i, slot) in [Slot::Primary, Slot::Parallel].into_iter().enumerate() {
+            if self.chapter_pending[i] {
+                continue;
+            }
+            let Some((id, book, chapter)) = self.online_target(slot) else {
+                continue;
+            };
+            let t = if slot == Slot::Primary {
+                self.translation.as_mut()
+            } else {
+                self.parallel.as_mut()
+            }
+            .unwrap();
+            let online = t.online.as_mut().unwrap();
+            if online.loaded == Some((book, chapter)) {
+                continue;
+            }
+            // Evict the last chapter before fetching another. No growing cache.
+            if let Some((b, c)) = online.loaded.take() {
+                t.books[b].chapters[c] = providers::placeholder(b, c);
+            }
+            online.error = None;
+            online.notice.clear();
+            self.chapter_pending[i] = true;
+            let tx = self.tx.clone();
+            thread::spawn(move || {
+                let result = worker(|| providers::fetch(&id, book, chapter));
+                let _ = tx.send(Msg::Chapter {
+                    id,
+                    slot,
+                    book,
+                    chapter,
+                    result,
+                });
+            });
+        }
+    }
+
+    fn accept_chapter(
+        &mut self,
+        id: &str,
+        slot: Slot,
+        book: usize,
+        chapter: usize,
+        result: Result<providers::Passage, String>,
+    ) {
+        // The user may have navigated or switched translations during the request.
+        if self.online_target(slot) != Some((id.to_string(), book, chapter)) {
+            return;
+        }
+        let selected = self
+            .translation
+            .as_ref()
+            .map(|t| t.position_from_loc(self.loc));
+        let t = if slot == Slot::Primary {
+            self.translation.as_mut()
+        } else {
+            self.parallel.as_mut()
+        }
+        .unwrap();
+        let online = t.online.as_mut().unwrap();
+        online.loaded = Some((book, chapter));
+        match result {
+            Ok(passage) => {
+                online.notice = passage.notice;
+                online.error = None;
+                t.books[book].chapters[chapter].verses = passage.verses;
+                if slot == Slot::Primary
+                    && let Some(loc) = selected.and_then(|p| t.loc_from_position(p))
+                {
+                    self.loc = loc;
+                }
+                self.side_cache = None;
+            }
+            Err(e) => {
+                online.error = Some(e);
+            }
+        }
     }
 
     fn install_translation(&mut self, t: Translation, slot: Slot) {
         self.installed = bible::installed();
         match slot {
             Slot::Primary => {
-                let previous = self.translation.as_ref().map(|old| old.position_from_loc(self.loc));
+                let previous = self
+                    .translation
+                    .as_ref()
+                    .map(|old| old.position_from_loc(self.loc));
                 let name = t.translation.clone();
                 let abbr = t.abbreviation.clone();
+                self.search_hits.clear();
+                self.search_index = 0;
                 self.translation = Some(t);
                 self.study.translation = Some(abbr);
                 let target = previous.or(self.study.last);
                 let loc = target
                     .and_then(|p| self.translation.as_ref().unwrap().loc_from_position(p))
-                    .unwrap_or(Loc { book: 0, chapter: 0, verse: 0 });
+                    .unwrap_or(Loc {
+                        book: 0,
+                        chapter: 0,
+                        verse: 0,
+                    });
                 self.loc = loc;
+                if self.mode == Mode::Translations {
+                    self.finish_translation_picker();
+                }
+                let first = std::mem::replace(&mut self.first_load, false);
+                let had_reference = self.pending_reference.is_some();
                 if let Some(r) = self.pending_reference.take() {
                     self.goto_reference(&r);
+                } else if first {
+                    match self.study.start.as_str() {
+                        "votd" => self.goto_votd(),
+                        "plan" => self.goto_plan_today(),
+                        _ => {}
+                    }
                 }
-                if self.mode == Mode::Translations {
-                    self.mode = Mode::Read;
+                if first
+                    && !had_reference
+                    && let Some(draft) = self.study.note_draft.clone()
+                    && let Some(loc) = self
+                        .translation
+                        .as_ref()
+                        .and_then(|t| t.loc_from_position(draft.position))
+                {
+                    self.loc = loc;
+                    self.note_buffer = draft.text;
+                    self.mode = Mode::Note;
                 }
                 self.set_status(format!("Reading {name}"));
-                let _ = self.study.save();
+                self.save();
             }
             Slot::Parallel => {
                 let abbr = t.abbreviation.clone();
+                let restoring = self.parallel.is_none()
+                    && self.study.parallel.as_deref() == Some(&abbr)
+                    && !(self.mode == Mode::Translations && self.picker_slot == Slot::Parallel);
                 self.parallel = Some(t);
                 self.study.parallel = Some(abbr);
-                self.parallel_visible = true;
-                self.study.parallel_visible = true;
+                self.parallel_visible = if restoring {
+                    self.study.parallel_visible
+                } else {
+                    true
+                };
+                self.study.parallel_visible = self.parallel_visible;
                 if self.mode == Mode::Translations {
-                    self.mode = Mode::Read;
+                    self.finish_translation_picker();
                 }
-                let _ = self.study.save();
+                self.save();
             }
         }
     }
@@ -381,6 +703,12 @@ impl App {
     }
 
     pub fn status_text(&self) -> Option<&str> {
+        if let Some(error) = &self.save_error {
+            return Some(error);
+        }
+        if let Some(warning) = &self.study.load_warning {
+            return Some(warning);
+        }
         match &self.status {
             Some((s, at)) if at.elapsed() < Duration::from_secs(6) => Some(s.as_str()),
             _ => None,
@@ -388,20 +716,42 @@ impl App {
     }
 
     pub fn position(&self) -> Option<Position> {
-        self.translation.as_ref().map(|t| t.position_from_loc(self.loc))
+        self.translation
+            .as_ref()
+            .map(|t| t.position_from_loc(self.loc))
     }
 
-    pub fn save(&mut self) {
-        self.study.last = self.position();
+    pub fn save(&mut self) -> bool {
+        if let Some(position) = self.position() {
+            self.study.last = Some(position);
+            if self.mode == Mode::Note {
+                self.study.note_draft = Some(crate::study::NoteDraft {
+                    position,
+                    text: self.note_buffer.clone(),
+                });
+            }
+        }
         self.study.parallel_visible = self.parallel_visible;
         if self.sidebar != 0 {
             self.study.sidebar = self.sidebar;
         }
-        let _ = self.study.save();
+        self.study.sidebar_visible = Some(self.sidebar != 0);
+        match self.study.save() {
+            Ok(()) => {
+                self.save_error = None;
+                true
+            }
+            Err(error) => {
+                self.save_error = Some(format!("Changes are not saved: {error}"));
+                false
+            }
+        }
     }
 
     fn push_history(&mut self) {
-        self.history.push(self.loc);
+        if let Some(position) = self.position() {
+            self.history.push(position);
+        }
         if self.history.len() > 100 {
             self.history.remove(0);
         }
@@ -416,7 +766,9 @@ impl App {
 
     /// Jump to a Position (book/chapter/verse numbers) if the translation has it.
     pub fn jump_position(&mut self, p: Position) -> bool {
-        let Some(t) = &self.translation else { return false };
+        let Some(t) = &self.translation else {
+            return false;
+        };
         match t.loc_from_position(p) {
             Some(loc) => {
                 self.jump(loc);
@@ -430,7 +782,9 @@ impl App {
     }
 
     pub fn goto_reference(&mut self, input: &str) -> bool {
-        let Some(t) = &self.translation else { return false };
+        let Some(t) = &self.translation else {
+            return false;
+        };
         match t.parse_reference(input) {
             Some(loc) => {
                 self.jump(loc);
@@ -446,7 +800,11 @@ impl App {
     fn verse_count(&self) -> usize {
         self.translation
             .as_ref()
-            .map(|t| t.books[self.loc.book].chapters[self.loc.chapter].verses.len())
+            .map(|t| {
+                t.books[self.loc.book].chapters[self.loc.chapter]
+                    .verses
+                    .len()
+            })
             .unwrap_or(0)
     }
 
@@ -477,7 +835,9 @@ impl App {
     }
 
     fn next_chapter(&mut self) -> bool {
-        let Some(t) = &self.translation else { return false };
+        let Some(t) = &self.translation else {
+            return false;
+        };
         let b = &t.books[self.loc.book];
         if self.loc.chapter + 1 < b.chapters.len() {
             self.loc.chapter += 1;
@@ -492,7 +852,9 @@ impl App {
     }
 
     fn prev_chapter(&mut self) -> bool {
-        let Some(t) = &self.translation else { return false };
+        let Some(t) = &self.translation else {
+            return false;
+        };
         if self.loc.chapter > 0 {
             self.loc.chapter -= 1;
         } else if self.loc.book > 0 {
@@ -511,11 +873,27 @@ impl App {
         let target = (self.loc.book as isize + delta).clamp(0, n - 1) as usize;
         if target != self.loc.book {
             self.push_history();
-            self.loc = Loc { book: target, chapter: 0, verse: 0 };
+            self.loc = Loc {
+                book: target,
+                chapter: 0,
+                verse: 0,
+            };
+        }
+    }
+
+    fn finish_translation_picker(&mut self) {
+        self.mode = self.return_to.take().unwrap_or(Mode::Read);
+        if self.mode == Mode::Settings {
+            self.list_index = if self.picker_slot == Slot::Primary {
+                0
+            } else {
+                1
+            };
         }
     }
 
     pub fn open_translations(&mut self, slot: Slot) {
+        self.return_to = None;
         self.mode = Mode::Translations;
         self.picker_slot = slot;
         self.filter.clear();
@@ -528,8 +906,18 @@ impl App {
         let f = self.filter.to_lowercase();
         let mut rows: Vec<(TranslationInfo, bool)> =
             self.installed.iter().cloned().map(|i| (i, true)).collect();
+        for c in providers::catalog() {
+            rows.push((c, false));
+        }
         for c in &self.catalog {
-            if !self.installed.iter().any(|i| i.abbreviation == c.abbreviation) {
+            if providers::is_online(&c.abbreviation) {
+                continue;
+            }
+            if !self
+                .installed
+                .iter()
+                .any(|i| i.abbreviation == c.abbreviation)
+            {
                 rows.push((c.clone(), false));
             }
         }
@@ -547,7 +935,9 @@ impl App {
     }
 
     pub fn book_rows(&self) -> Vec<(usize, String)> {
-        let Some(t) = &self.translation else { return Vec::new() };
+        let Some(t) = &self.translation else {
+            return Vec::new();
+        };
         let f = self.filter.to_lowercase();
         t.books
             .iter()
@@ -558,7 +948,9 @@ impl App {
     }
 
     pub fn bookmark_rows(&self) -> Vec<(Position, String, String)> {
-        let Some(t) = &self.translation else { return Vec::new() };
+        let Some(t) = &self.translation else {
+            return Vec::new();
+        };
         self.study
             .bookmarks
             .iter()
@@ -574,7 +966,11 @@ impl App {
 
     /// Human reference for a Position in the current translation.
     pub fn label(&self, p: Position) -> String {
-        match self.translation.as_ref().and_then(|t| t.loc_from_position(p).map(|l| t.reference(l))) {
+        match self
+            .translation
+            .as_ref()
+            .and_then(|t| t.loc_from_position(p).map(|l| t.reference(l)))
+        {
             Some(s) => s,
             None => p.key(),
         }
@@ -583,7 +979,10 @@ impl App {
     pub fn text_at(&self, p: Position) -> String {
         self.translation
             .as_ref()
-            .and_then(|t| t.loc_from_position(p).and_then(|l| t.verse_text(l).map(|s| s.to_string())))
+            .and_then(|t| {
+                t.loc_from_position(p)
+                    .and_then(|l| t.verse_text(l).map(|s| s.to_string()))
+            })
             .unwrap_or_default()
     }
 
@@ -595,7 +994,9 @@ impl App {
             .spawn()
             .map_err(|e| format!("wl-copy: {e}"))?;
         if let Some(mut stdin) = child.stdin.take() {
-            stdin.write_all(text.as_bytes()).map_err(|e| e.to_string())?;
+            stdin
+                .write_all(text.as_bytes())
+                .map_err(|e| e.to_string())?;
         }
         child.wait().map_err(|e| e.to_string())?;
         Ok(())
@@ -615,9 +1016,18 @@ impl App {
 
     /// Sidebar content for the current verse, recomputed when the key changes.
     pub fn side_content(&mut self) -> &SideContent {
-        let pos = self.position().unwrap_or(Position { book: 1, chapter: 1, verse: 1 });
+        let pos = self.position().unwrap_or(Position {
+            book: 1,
+            chapter: 1,
+            verse: 1,
+        });
         let key = (pos, self.sidebar, self.commentary_id().unwrap_or_default());
-        if self.side_cache.as_ref().map(|c| c.key != key).unwrap_or(true) {
+        if self
+            .side_cache
+            .as_ref()
+            .map(|c| c.key != key)
+            .unwrap_or(true)
+        {
             let content = self.compute_side(pos);
             self.side_cache = Some(SideCache { key, content });
             self.side_index = 0;
@@ -641,7 +1051,12 @@ impl App {
                                 label.push_str(&format!("-{}:{}", e.chapter, e.verse));
                             }
                         }
-                        items.push(RefItem { pos: r.to, label, text: self.text_at(r.to), source: "openbible" });
+                        items.push(RefItem {
+                            pos: r.to,
+                            label,
+                            text: self.text_at(r.to),
+                            source: "openbible",
+                        });
                     }
                 }
                 let tsk_raw = self.resources.commentary("tsk").and_then(|t| t.raw(pos));
@@ -649,13 +1064,18 @@ impl App {
                     for (p, _) in parse_tsk(&raw, pos) {
                         if !items.iter().any(|i| i.pos == p) {
                             let (label, text) = (self.label(p), self.text_at(p));
-                            items.push(RefItem { pos: p, label, text, source: "tsk" });
+                            items.push(RefItem {
+                                pos: p,
+                                label,
+                                text,
+                                source: "tsk",
+                            });
                         }
                     }
                 }
                 if items.is_empty() {
                     if !resources::is_installed("crossrefs") && !resources::is_installed("tsk") {
-                        SideContent::Empty("No cross-reference pack installed.\n\nPress R to install OpenBible cross-references or the Treasury of Scripture Knowledge.".into())
+                        SideContent::Empty("No cross-reference pack installed.\n\nOpen Resources to install OpenBible cross-references or the Treasury of Scripture Knowledge.".into())
                     } else {
                         SideContent::Empty("No cross-references for this verse.".into())
                     }
@@ -665,10 +1085,14 @@ impl App {
             }
             TAB_WORDS => {
                 let nt = pos.book >= 40;
-                let id = if nt { "interlinear-nt" } else { "interlinear-ot" };
+                let id = if nt {
+                    "interlinear-nt"
+                } else {
+                    "interlinear-ot"
+                };
                 if !resources::is_installed(id) {
                     return SideContent::Empty(format!(
-                        "The {} interlinear pack is not installed.\n\nPress R to install it.",
+                        "The {} interlinear pack is not installed.\n\nOpen Resources to install it.",
                         if nt { "Greek NT" } else { "Hebrew OT" }
                     ));
                 }
@@ -681,30 +1105,43 @@ impl App {
             }
             TAB_COMMENTARY => {
                 let Some(id) = self.commentary_id() else {
-                    return SideContent::Empty("No commentary installed.\n\nPress R to install Matthew Henry, Barnes, Clarke, JFB, Calvin, Wesley or the Geneva notes.".into());
+                    return SideContent::Empty("No commentary installed.\n\nOpen Resources to install Matthew Henry, Barnes, Clarke, JFB, Calvin, Wesley or the Geneva notes.".into());
                 };
                 let name = resources::pack(&id).map(|p| p.name).unwrap_or("Commentary");
                 match self.resources.commentary(&id) {
                     Some(c) => match c.lookup(pos) {
                         Some((text, from)) => {
-                            let title = if from == pos.verse { name.to_string() } else { format!("{name} (on verse {from})") };
+                            let title = if from == pos.verse {
+                                name.to_string()
+                            } else {
+                                format!("{name} (on verse {from})")
+                            };
                             SideContent::Text { title, body: text }
                         }
-                        None => SideContent::Text { title: name.into(), body: "No comment on this passage.".into() },
+                        None => SideContent::Text {
+                            title: name.into(),
+                            body: "No comment on this passage.".into(),
+                        },
                     },
                     None => SideContent::Empty(format!("Could not open {name}.")),
                 }
             }
             TAB_NOTES => {
                 if !resources::is_installed("uw-notes") {
-                    return SideContent::Empty("unfoldingWord Translation Notes are not installed.\n\nPress R to install them.".into());
+                    return SideContent::Empty("unfoldingWord Translation Notes are not installed.\n\nOpen Resources to install them.".into());
                 }
                 let notes = self.resources.notes.verse(pos);
                 if notes.is_empty() {
                     let intro = self.resources.notes.chapter_intro(pos);
                     return match intro {
-                        Some(n) if pos.verse == 1 => SideContent::Text { title: "Chapter introduction".into(), body: n.text },
-                        _ => SideContent::Text { title: "unfoldingWord notes".into(), body: "No notes on this verse.".into() },
+                        Some(n) if pos.verse == 1 => SideContent::Text {
+                            title: "Chapter introduction".into(),
+                            body: n.text,
+                        },
+                        _ => SideContent::Text {
+                            title: "unfoldingWord notes".into(),
+                            body: "No notes on this verse.".into(),
+                        },
                     };
                 }
                 let mut body = String::new();
@@ -715,7 +1152,10 @@ impl App {
                     body.push_str(&n.text);
                     body.push_str("\n\n");
                 }
-                SideContent::Text { title: "unfoldingWord notes".into(), body: body.trim_end().to_string() }
+                SideContent::Text {
+                    title: "unfoldingWord notes".into(),
+                    body: body.trim_end().to_string(),
+                }
             }
             _ => SideContent::Empty(String::new()),
         }
@@ -729,17 +1169,26 @@ impl App {
         }
     }
 
-    fn show_tab(&mut self, tab: u8) {
+    pub fn show_tab(&mut self, tab: u8) {
         self.sidebar = tab;
         self.study.sidebar = tab;
         self.side_index = 0;
         self.side_scroll = 0;
     }
 
-    fn open_word_study(&mut self, word: Word) {
+    pub fn open_word_study(&mut self, word: Word) {
         let strong = word.strong.clone();
-        let entry = self.resources.lexicon(&strong).and_then(|l| l.get(&strong)).cloned();
-        self.word_study = Some(WordStudy { strong, word: Some(word), entry, occurrences: None });
+        let entry = self
+            .resources
+            .lexicon(&strong)
+            .and_then(|l| l.get(&strong))
+            .cloned();
+        self.word_study = Some(WordStudy {
+            strong,
+            word: Some(word),
+            entry,
+            occurrences: None,
+        });
         self.text_scroll = 0;
         self.mode = Mode::WordStudy;
     }
@@ -753,7 +1202,10 @@ impl App {
         }
         let act = match self.side_content() {
             SideContent::Refs(v) => v.get(idx).map(|r| Act::Jump(r.pos)).unwrap_or(Act::None),
-            SideContent::Words(v) => v.get(idx).map(|w| Act::Word(w.clone())).unwrap_or(Act::None),
+            SideContent::Words(v) => v
+                .get(idx)
+                .map(|w| Act::Word(w.clone()))
+                .unwrap_or(Act::None),
             _ => Act::None,
         };
         match act {
@@ -768,13 +1220,17 @@ impl App {
     fn cycle_commentary(&mut self) {
         let ids = Store::commentary_ids();
         if ids.is_empty() {
-            self.set_status("No commentaries installed. Press R to add some.".into());
+            self.set_status("No commentaries installed. Open Resources to add a commentary.".into());
             return;
         }
         let cur = self.commentary_id().unwrap_or_default();
-        let i = ids.iter().position(|s| *s == cur).map(|i| (i + 1) % ids.len()).unwrap_or(0);
+        let i = ids
+            .iter()
+            .position(|s| *s == cur)
+            .map(|i| (i + 1) % ids.len())
+            .unwrap_or(0);
         self.study.commentary = Some(ids[i].to_string());
-        let _ = self.study.save();
+        self.save();
         self.show_tab(TAB_COMMENTARY);
         let name = resources::pack(ids[i]).map(|p| p.name).unwrap_or(ids[i]);
         self.set_status(format!("Commentary: {name}"));
@@ -785,14 +1241,22 @@ impl App {
         self.harmony_items.clear();
         for (per, ranges) in harmony::find(pos) {
             for r in ranges {
-                self.harmony_items.push(HarmonyItem { title: per.title, range: r, current: r.contains(pos) });
+                self.harmony_items.push(HarmonyItem {
+                    title: per.title,
+                    range: r,
+                    current: r.contains(pos),
+                });
             }
         }
-        self.list_index = self.harmony_items.iter().position(|i| !i.current).unwrap_or(0);
+        self.list_index = self
+            .harmony_items
+            .iter()
+            .position(|i| !i.current)
+            .unwrap_or(0);
         self.mode = Mode::Harmony;
     }
 
-    fn dict_search(&mut self) {
+    pub fn dict_search(&mut self) {
         let q = self.filter.clone();
         let mut out = Vec::new();
         if q.trim().is_empty() {
@@ -809,7 +1273,11 @@ impl App {
         }
         if let Some(w) = self.resources.words() {
             for (slug, title) in w.search(&q, 25) {
-                out.push(("uw-words".into(), "unfoldingWord".into(), format!("{title} [{slug}]")));
+                out.push((
+                    "uw-words".into(),
+                    "unfoldingWord".into(),
+                    format!("{title} [{slug}]"),
+                ));
             }
         }
         self.dict_results = out;
@@ -817,23 +1285,44 @@ impl App {
     }
 
     fn open_dict_entry(&mut self) {
-        let Some((id, name, key)) = self.dict_results.get(self.list_index).cloned() else { return };
+        let Some((id, name, key)) = self.dict_results.get(self.list_index).cloned() else {
+            return;
+        };
         let body = if id == "uw-words" {
             let slug = key.rsplit('[').next().unwrap_or("").trim_end_matches(']');
-            self.resources.words().and_then(|w| w.get(slug)).map(|w| format!("{}\n\n{}", w.title, clean_md(&w.body)))
+            self.resources
+                .words()
+                .and_then(|w| w.get(slug))
+                .map(|w| format!("{}\n\n{}", w.title, clean_md(&w.body)))
         } else {
             self.resources.dictionary(&id).and_then(|d| d.entry(&key))
         };
-        self.dict_entry = Some((format!("{name}: {key}"), body.unwrap_or_else(|| "Entry not found.".into())));
+        self.dict_entry = Some((
+            format!("{name}: {key}"),
+            body.unwrap_or_else(|| "Entry not found.".into()),
+        ));
         self.text_scroll = 0;
         self.mode = Mode::DictEntry;
     }
 
-    fn goto_votd(&mut self) {
+    pub fn goto_votd(&mut self) {
         let Some(t) = &self.translation else { return };
         if let Some((loc, r)) = votd::today(t) {
             self.jump(loc);
             self.set_status(format!("Verse of the day: {r}"));
+        }
+    }
+
+    /// Open the first chapter of today's reading-plan entry.
+    pub fn goto_plan_today(&mut self) {
+        let Some(p) = &self.study.plan else { return };
+        let day = p.current_day().min(p.days().saturating_sub(1));
+        if let Some((b, c)) = plans::readings(&p.id, day).first().copied() {
+            self.jump_position(Position {
+                book: b,
+                chapter: c,
+                verse: 1,
+            });
         }
     }
 
@@ -871,7 +1360,200 @@ impl App {
             Mode::DictEntry => self.key_scroll_popup(key),
             Mode::WordStudy => self.key_word_study(key),
             Mode::Occurrences => self.key_occurrences(key),
+            Mode::Menu => self.key_menu(key),
+            Mode::Settings => self.key_settings(key),
         }
+    }
+
+    // ---------------------------------------------------------------------
+    // Mouse
+    // ---------------------------------------------------------------------
+
+    pub fn handle_mouse(&mut self, m: MouseEvent) {
+        let (x, y) = (m.column, m.row);
+        let inside = |r: Rect| x >= r.x && x < r.x + r.width && y >= r.y && y < r.y + r.height;
+        match m.kind {
+            MouseEventKind::Down(MouseButton::Left) => {
+                let action = self
+                    .hits
+                    .iter()
+                    .rev()
+                    .find(|h| !matches!(h.action, Action::Scroll(_)) && inside(h.rect))
+                    .map(|h| h.action.clone());
+                if let Some(a) = action {
+                    self.run_action(a);
+                }
+            }
+            MouseEventKind::Down(MouseButton::Right) => {
+                if self.mode != Mode::Read {
+                    self.handle_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
+                } else if self.focus_side {
+                    self.focus_side = false;
+                }
+            }
+            MouseEventKind::ScrollDown | MouseEventKind::ScrollUp => {
+                let down = m.kind == MouseEventKind::ScrollDown;
+                let area = self.hits.iter().rev().find_map(|h| match h.action {
+                    Action::Scroll(a) if inside(h.rect) => Some(a),
+                    _ => None,
+                });
+                if let Some(a) = area {
+                    self.scroll_area(a, down);
+                }
+            }
+            _ => {}
+        }
+    }
+
+    fn press(&mut self, code: KeyCode) {
+        self.handle_key(KeyEvent::new(code, KeyModifiers::NONE));
+    }
+
+    fn run_action(&mut self, action: Action) {
+        match action {
+            Action::Key(code, mods) => self.handle_key(KeyEvent::new(code, mods)),
+            Action::Verse(p) => {
+                self.focus_side = false;
+                if let Some(loc) = self
+                    .translation
+                    .as_ref()
+                    .and_then(|t| t.loc_from_position(p))
+                {
+                    self.loc = loc;
+                }
+            }
+            Action::FocusMain => self.focus_side = false,
+            Action::FocusSide => {
+                if self.sidebar != 0 {
+                    self.focus_side = true;
+                }
+            }
+            Action::Tab(t) => self.show_tab(t),
+            Action::SideItem(i) => {
+                self.focus_side = true;
+                self.side_index = i;
+                self.side_enter();
+            }
+            Action::Select(i) => {
+                // First click selects; clicking the selected item opens it.
+                if self.list_index == i {
+                    self.press(KeyCode::Enter);
+                } else {
+                    self.list_index = i;
+                }
+            }
+            Action::Open(i) => {
+                self.list_index = i;
+                self.press(KeyCode::Enter);
+            }
+            Action::Chapter(i) => {
+                self.chapter_pick = i;
+                self.press(KeyCode::Enter);
+            }
+            Action::Menu(i) => {
+                if self.mode == Mode::Menu && self.menu == i {
+                    self.mode = Mode::Read;
+                } else if matches!(self.mode, Mode::Read | Mode::Menu) {
+                    self.mode = Mode::Menu;
+                    self.menu = i;
+                    self.list_index = 0;
+                }
+            }
+            Action::MenuItem(i) => {
+                self.list_index = i;
+                self.press(KeyCode::Enter);
+            }
+            Action::Adjust(i, dir) => {
+                self.list_index = i;
+                self.press(if dir < 0 {
+                    KeyCode::Left
+                } else {
+                    KeyCode::Right
+                });
+            }
+            Action::Scroll(_) | Action::None => {}
+            Action::Dismiss => self.press(KeyCode::Esc),
+        }
+    }
+
+    fn scroll_area(&mut self, area: ScrollArea, down: bool) {
+        match area {
+            ScrollArea::Main | ScrollArea::Parallel => {
+                if self.mode == Mode::Read {
+                    self.move_verse(if down { 1 } else { -1 });
+                }
+            }
+            ScrollArea::Side => {
+                if self.mode != Mode::Read {
+                    return;
+                }
+                let is_text = matches!(
+                    self.side_content(),
+                    SideContent::Text { .. } | SideContent::Empty(_)
+                );
+                if is_text {
+                    self.side_scroll = if down {
+                        self.side_scroll + 3
+                    } else {
+                        self.side_scroll.saturating_sub(3)
+                    };
+                } else {
+                    let n = self.side_len();
+                    self.focus_side = true;
+                    self.side_index = if down {
+                        (self.side_index + 1).min(n.saturating_sub(1))
+                    } else {
+                        self.side_index.saturating_sub(1)
+                    };
+                }
+            }
+            ScrollArea::List | ScrollArea::Chapters => {
+                self.press(if down { KeyCode::Down } else { KeyCode::Up })
+            }
+            ScrollArea::Text => {
+                self.text_scroll = if down {
+                    self.text_scroll.saturating_add(3)
+                } else {
+                    self.text_scroll.saturating_sub(3)
+                }
+            }
+        }
+    }
+
+    fn key_menu(&mut self, key: KeyEvent) {
+        let n = MENUS.len();
+        let items = MENUS[self.menu].items;
+        match key.code {
+            KeyCode::Esc | KeyCode::F(10) => self.mode = Mode::Read,
+            KeyCode::Left | KeyCode::Char('h') | KeyCode::BackTab => {
+                self.menu = (self.menu + n - 1) % n;
+                self.list_index = 0;
+            }
+            KeyCode::Right | KeyCode::Char('l') | KeyCode::Tab => {
+                self.menu = (self.menu + 1) % n;
+                self.list_index = 0;
+            }
+            KeyCode::Down | KeyCode::Char('j') => {
+                self.list_index = (self.list_index + 1) % items.len()
+            }
+            KeyCode::Up | KeyCode::Char('k') => {
+                self.list_index = (self.list_index + items.len() - 1) % items.len()
+            }
+            KeyCode::Enter => {
+                let code = items[self.list_index.min(items.len() - 1)].code;
+                self.mode = Mode::Read;
+                self.press(code);
+            }
+            _ => {
+                self.mode = Mode::Read;
+                self.handle_key(key);
+            }
+        }
+    }
+
+    /// Footer buttons for the current mode.
+    pub fn footer_buttons(&self) -> Vec<menu::Button> {
+        menu::footer(self)
     }
 
     fn key_read(&mut self, key: KeyEvent) {
@@ -885,11 +1567,34 @@ impl App {
                     self.mode = Mode::Resources;
                     self.list_index = 0;
                 }
+                KeyCode::Char(',') | KeyCode::Char('S') => self.open_settings(),
                 _ => {}
             }
             return;
         }
         match key.code {
+            KeyCode::F(5) => {
+                let selected = self
+                    .translation
+                    .as_ref()
+                    .map(|t| t.position_from_loc(self.loc));
+                for t in [&mut self.translation, &mut self.parallel]
+                    .into_iter()
+                    .flatten()
+                {
+                    if let Some(o) = &mut t.online {
+                        if let Some((b, c)) = o.loaded.take() {
+                            t.books[b].chapters[c] = providers::placeholder(b, c);
+                        }
+                        o.error = None;
+                    }
+                }
+                if let Some(loc) =
+                    selected.and_then(|p| self.translation.as_ref()?.loc_from_position(p))
+                {
+                    self.loc = loc;
+                }
+            }
             KeyCode::Char('q') => self.should_quit = true,
             KeyCode::Char('j') | KeyCode::Down => self.move_verse(1),
             KeyCode::Char('k') | KeyCode::Up => self.move_verse(-1),
@@ -898,7 +1603,9 @@ impl App {
             KeyCode::Char('J') | KeyCode::PageDown | KeyCode::Char(' ') => self.move_verse(10),
             KeyCode::Char('K') | KeyCode::PageUp => self.move_verse(-10),
             KeyCode::Char('g') | KeyCode::Home => self.loc.verse = 0,
-            KeyCode::Char('G') | KeyCode::End => self.loc.verse = self.verse_count().saturating_sub(1),
+            KeyCode::Char('G') | KeyCode::End => {
+                self.loc.verse = self.verse_count().saturating_sub(1)
+            }
             KeyCode::Char('l') | KeyCode::Right => {
                 self.next_chapter();
             }
@@ -926,7 +1633,9 @@ impl App {
                     self.parallel_visible = !self.parallel_visible;
                     self.study.parallel_visible = self.parallel_visible;
                 } else {
-                    self.set_status("No parallel translation yet. Press T to pick one.".to_string());
+                    self.set_status(
+                        "No parallel Bible selected. Open Settings and choose a Parallel Bible.".to_string(),
+                    );
                     self.open_translations(Slot::Parallel);
                 }
             }
@@ -942,8 +1651,12 @@ impl App {
             KeyCode::Char('m') => {
                 if let Some(p) = self.position() {
                     let added = self.study.toggle_bookmark(p);
-                    let _ = self.study.save();
-                    self.set_status(if added { "Bookmarked".into() } else { "Bookmark removed".into() });
+                    self.save();
+                    self.set_status(if added {
+                        "Bookmarked".into()
+                    } else {
+                        "Bookmark removed".into()
+                    });
                 }
             }
             KeyCode::Char('B') => {
@@ -953,7 +1666,7 @@ impl App {
             KeyCode::Char('x') => {
                 if let Some(p) = self.position() {
                     let h = self.study.cycle_highlight(p);
-                    let _ = self.study.save();
+                    self.save();
                     self.set_status(format!("Highlight: {}", HIGHLIGHT_NAMES[h as usize]));
                 }
             }
@@ -965,11 +1678,15 @@ impl App {
             }
             KeyCode::Char('y') => {
                 if let Some(t) = &self.translation {
+                    let Some(verse) = t.verse_text(self.loc) else {
+                        self.set_status("Wait for the chapter to load before copying".into());
+                        return;
+                    };
                     let text = format!(
                         "{} ({})\n{}",
                         t.reference(self.loc),
                         t.abbreviation.to_uppercase(),
-                        t.verse_text(self.loc).unwrap_or("")
+                        verse
                     );
                     match Self::copy_to_clipboard(&text) {
                         Ok(()) => self.set_status("Verse copied to clipboard".into()),
@@ -978,8 +1695,12 @@ impl App {
                 }
             }
             KeyCode::Char('u') | KeyCode::Backspace => {
-                if let Some(prev) = self.history.pop() {
-                    self.loc = prev;
+                if let Some(loc) = self
+                    .history
+                    .pop()
+                    .and_then(|p| self.translation.as_ref()?.loc_from_position(p))
+                {
+                    self.loc = loc;
                 }
             }
             // --- study ---
@@ -1028,13 +1749,22 @@ impl App {
                 self.mode = Mode::Help;
                 self.text_scroll = 0;
             }
+            KeyCode::F(10) => {
+                self.mode = Mode::Menu;
+                self.menu = 0;
+                self.list_index = 0;
+            }
+            KeyCode::Char(',') | KeyCode::Char('S') => self.open_settings(),
             _ => {}
         }
     }
 
     fn key_side(&mut self, key: KeyEvent) {
         let n = self.side_len();
-        let is_text = matches!(self.side_content(), SideContent::Text { .. } | SideContent::Empty(_));
+        let is_text = matches!(
+            self.side_content(),
+            SideContent::Text { .. } | SideContent::Empty(_)
+        );
         match key.code {
             KeyCode::Esc | KeyCode::Tab => self.focus_side = false,
             KeyCode::Char('q') => self.should_quit = true,
@@ -1098,7 +1828,7 @@ impl App {
 
     fn step_search(&mut self, delta: isize) {
         if self.search_hits.is_empty() {
-            self.set_status("No search results. Press / to search.".into());
+            self.set_status("No search results yet. Open Search to find a word or phrase.".into());
             return;
         }
         let n = self.search_hits.len() as isize;
@@ -1120,8 +1850,12 @@ impl App {
         match key.code {
             KeyCode::Char('j') | KeyCode::Down => self.list_index = (self.list_index + 1) % n,
             KeyCode::Char('k') | KeyCode::Up => self.list_index = (self.list_index + n - 1) % n,
-            KeyCode::PageDown | KeyCode::Char('J') => self.list_index = (self.list_index + 10).min(n - 1),
-            KeyCode::PageUp | KeyCode::Char('K') => self.list_index = self.list_index.saturating_sub(10),
+            KeyCode::PageDown | KeyCode::Char('J') => {
+                self.list_index = (self.list_index + 10).min(n - 1)
+            }
+            KeyCode::PageUp | KeyCode::Char('K') => {
+                self.list_index = self.list_index.saturating_sub(10)
+            }
             KeyCode::Char('g') => self.list_index = 0,
             KeyCode::Char('G') => self.list_index = n - 1,
             _ => return false,
@@ -1148,9 +1882,15 @@ impl App {
                     self.book_pick = *idx;
                     self.chapter_pick = 0;
                     self.number_buffer.clear();
-                    let chapters = self.translation.as_ref().unwrap().books[*idx].chapters.len();
+                    let chapters = self.translation.as_ref().unwrap().books[*idx]
+                        .chapters
+                        .len();
                     if chapters == 1 {
-                        self.jump(Loc { book: *idx, chapter: 0, verse: 0 });
+                        self.jump(Loc {
+                            book: *idx,
+                            chapter: 0,
+                            verse: 0,
+                        });
                     } else {
                         self.mode = Mode::Chapters;
                     }
@@ -1191,10 +1931,18 @@ impl App {
                 self.mode = Mode::Read;
                 self.number_buffer.clear();
             }
-            KeyCode::Char('l') | KeyCode::Right => self.chapter_pick = (self.chapter_pick + 1).min(n - 1),
-            KeyCode::Char('h') | KeyCode::Left => self.chapter_pick = self.chapter_pick.saturating_sub(1),
-            KeyCode::Char('j') | KeyCode::Down => self.chapter_pick = (self.chapter_pick + cols).min(n - 1),
-            KeyCode::Char('k') | KeyCode::Up => self.chapter_pick = self.chapter_pick.saturating_sub(cols),
+            KeyCode::Char('l') | KeyCode::Right => {
+                self.chapter_pick = (self.chapter_pick + 1).min(n - 1)
+            }
+            KeyCode::Char('h') | KeyCode::Left => {
+                self.chapter_pick = self.chapter_pick.saturating_sub(1)
+            }
+            KeyCode::Char('j') | KeyCode::Down => {
+                self.chapter_pick = (self.chapter_pick + cols).min(n - 1)
+            }
+            KeyCode::Char('k') | KeyCode::Up => {
+                self.chapter_pick = self.chapter_pick.saturating_sub(cols)
+            }
             KeyCode::Char('g') => self.chapter_pick = 0,
             KeyCode::Char('G') => self.chapter_pick = n - 1,
             KeyCode::Char('b') => {
@@ -1206,12 +1954,21 @@ impl App {
             }
             KeyCode::Char(c) if c.is_ascii_digit() => {
                 self.number_buffer.push(c);
-                let parsed = self.number_buffer.parse::<usize>().ok().filter(|num| *num >= 1 && *num <= n);
+                let parsed = self
+                    .number_buffer
+                    .parse::<usize>()
+                    .ok()
+                    .filter(|num| *num >= 1 && *num <= n);
                 match parsed {
                     Some(num) => self.chapter_pick = num - 1,
                     None => {
                         self.number_buffer = c.to_string();
-                        if let Some(num) = self.number_buffer.parse::<usize>().ok().filter(|num| *num >= 1 && *num <= n) {
+                        if let Some(num) = self
+                            .number_buffer
+                            .parse::<usize>()
+                            .ok()
+                            .filter(|num| *num >= 1 && *num <= n)
+                        {
                             self.chapter_pick = num - 1;
                         }
                     }
@@ -1219,7 +1976,11 @@ impl App {
             }
             KeyCode::Enter => {
                 self.number_buffer.clear();
-                self.jump(Loc { book: self.book_pick, chapter: self.chapter_pick, verse: 0 });
+                self.jump(Loc {
+                    book: self.book_pick,
+                    chapter: self.chapter_pick,
+                    verse: 0,
+                });
             }
             _ => {}
         }
@@ -1230,7 +1991,7 @@ impl App {
         match key.code {
             KeyCode::Esc => {
                 if self.translation.is_some() {
-                    self.mode = Mode::Read;
+                    self.finish_translation_picker();
                 } else {
                     self.should_quit = true;
                 }
@@ -1259,7 +2020,7 @@ impl App {
                 if let Some((info, installed)) = rows.get(self.list_index) {
                     let abbr = info.abbreviation.clone();
                     let slot = self.picker_slot;
-                    if *installed {
+                    if *installed || providers::is_online(&abbr) {
                         self.busy = Some(format!("Loading {}…", abbr.to_uppercase()));
                         self.spawn_load(abbr, slot);
                     } else {
@@ -1289,10 +2050,8 @@ impl App {
                                 self.list_index = (self.list_index + 1) % rows.len();
                             }
                         }
-                        'p' => {
-                            if !rows.is_empty() {
-                                self.list_index = (self.list_index + rows.len() - 1) % rows.len();
-                            }
+                        'p' if !rows.is_empty() => {
+                            self.list_index = (self.list_index + rows.len() - 1) % rows.len();
                         }
                         _ => {}
                     }
@@ -1311,14 +2070,23 @@ impl App {
             return;
         };
         let abbr = info.abbreviation.clone();
-        let in_use = self.translation.as_ref().map(|t| t.abbreviation == abbr).unwrap_or(false);
+        let in_use = self
+            .translation
+            .as_ref()
+            .map(|t| t.abbreviation == abbr)
+            .unwrap_or(false);
         if in_use {
             self.set_status("Switch to another translation before deleting this one".into());
             return;
         }
         match bible::remove(&abbr) {
             Ok(()) => {
-                if self.parallel.as_ref().map(|t| t.abbreviation == abbr).unwrap_or(false) {
+                if self
+                    .parallel
+                    .as_ref()
+                    .map(|t| t.abbreviation == abbr)
+                    .unwrap_or(false)
+                {
                     self.parallel = None;
                     self.parallel_visible = false;
                     self.study.parallel = None;
@@ -1335,6 +2103,14 @@ impl App {
             KeyCode::Esc => self.mode = Mode::Read,
             KeyCode::Enter => {
                 let Some(t) = &self.translation else { return };
+                if t.online.is_some() {
+                    self.set_status(
+                        "Whole-Bible search needs an offline Bible. Choose a downloaded edition from your library."
+                            .into(),
+                    );
+                    self.mode = Mode::Read;
+                    return;
+                }
                 self.search_hits = t.search(&self.search_query, SEARCH_LIMIT);
                 self.search_index = 0;
                 self.list_index = 0;
@@ -1348,7 +2124,9 @@ impl App {
             KeyCode::Backspace => {
                 self.search_query.pop();
             }
-            KeyCode::Char('u') if key.modifiers.contains(KeyModifiers::CONTROL) => self.search_query.clear(),
+            KeyCode::Char('u') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                self.search_query.clear()
+            }
             KeyCode::Char(c) => self.search_query.push(c),
             _ => {}
         }
@@ -1387,7 +2165,9 @@ impl App {
             KeyCode::Backspace => {
                 self.filter.pop();
             }
-            KeyCode::Char('u') if key.modifiers.contains(KeyModifiers::CONTROL) => self.filter.clear(),
+            KeyCode::Char('u') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                self.filter.clear()
+            }
             KeyCode::Char(c) => self.filter.push(c),
             _ => {}
         }
@@ -1396,14 +2176,22 @@ impl App {
     fn key_note(&mut self, key: KeyEvent) {
         let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
         match key.code {
-            KeyCode::Esc => self.mode = Mode::Read,
+            KeyCode::Esc => {
+                self.mode = Mode::Read;
+                self.study.note_draft = None;
+                self.save();
+            }
             KeyCode::Char('s') if ctrl => {
                 if let Some(p) = self.position() {
                     self.study.set_note(p, &self.note_buffer);
-                    let _ = self.study.save();
-                    self.set_status("Note saved".into());
+                    self.mode = Mode::Read;
+                    self.study.note_draft = None;
+                    if self.save() {
+                        self.set_status("Note saved".into());
+                    } else {
+                        self.mode = Mode::Note;
+                    }
                 }
-                self.mode = Mode::Read;
             }
             KeyCode::Char('u') if ctrl => self.note_buffer.clear(),
             KeyCode::Enter => self.note_buffer.push('\n'),
@@ -1426,7 +2214,7 @@ impl App {
             KeyCode::Char('d') | KeyCode::Delete => {
                 if self.list_index < n {
                     self.study.bookmarks.remove(self.list_index);
-                    let _ = self.study.save();
+                    self.save();
                     if self.list_index >= self.study.bookmarks.len() {
                         self.list_index = self.study.bookmarks.len().saturating_sub(1);
                     }
@@ -1449,11 +2237,21 @@ impl App {
                     _ => Mode::Read,
                 }
             }
-            KeyCode::Char('?') | KeyCode::Enter if self.mode == Mode::Help => self.mode = Mode::Read,
-            KeyCode::Char('j') | KeyCode::Down => self.text_scroll = self.text_scroll.saturating_add(1),
-            KeyCode::Char('k') | KeyCode::Up => self.text_scroll = self.text_scroll.saturating_sub(1),
-            KeyCode::Char('J') | KeyCode::PageDown | KeyCode::Char(' ') => self.text_scroll = self.text_scroll.saturating_add(10),
-            KeyCode::Char('K') | KeyCode::PageUp => self.text_scroll = self.text_scroll.saturating_sub(10),
+            KeyCode::Char('?') | KeyCode::Enter if self.mode == Mode::Help => {
+                self.mode = Mode::Read
+            }
+            KeyCode::Char('j') | KeyCode::Down => {
+                self.text_scroll = self.text_scroll.saturating_add(1)
+            }
+            KeyCode::Char('k') | KeyCode::Up => {
+                self.text_scroll = self.text_scroll.saturating_sub(1)
+            }
+            KeyCode::Char('J') | KeyCode::PageDown | KeyCode::Char(' ') => {
+                self.text_scroll = self.text_scroll.saturating_add(10)
+            }
+            KeyCode::Char('K') | KeyCode::PageUp => {
+                self.text_scroll = self.text_scroll.saturating_sub(10)
+            }
             KeyCode::Char('g') => self.text_scroll = 0,
             KeyCode::Char('G') => self.text_scroll = u16::MAX / 2,
             _ => {}
@@ -1470,7 +2268,7 @@ impl App {
             KeyCode::Enter | KeyCode::Char('i') => {
                 let p = &resources::PACKS[self.list_index];
                 if resources::is_installed(p.id) {
-                    self.set_status(format!("{} is already installed (d removes it)", p.name));
+                    self.set_status(format!("{} is already installed. Choose Remove in Resources to uninstall it.", p.name));
                 } else if self.busy.is_some() {
                     self.set_status("Please wait for the current download to finish".into());
                 } else {
@@ -1495,7 +2293,10 @@ impl App {
             KeyCode::Char('a') => {
                 if self.busy.is_some() {
                     self.set_status("A download is already running".into());
-                } else if let Some(p) = resources::PACKS.iter().find(|p| !resources::is_installed(p.id)) {
+                } else if let Some(p) = resources::PACKS
+                    .iter()
+                    .find(|p| !resources::is_installed(p.id))
+                {
                     self.install_all = true;
                     self.spawn_install(p.id.to_string());
                     self.set_status("Installing every missing pack, one at a time…".into());
@@ -1541,9 +2342,11 @@ impl App {
             match key.code {
                 KeyCode::Esc | KeyCode::Char('q') | KeyCode::Char('r') => self.mode = Mode::Read,
                 KeyCode::Enter => {
-                    let p = &plans::PLANS[self.list_index];
+                    let Some(p) = plans::PLANS.get(self.list_index) else {
+                        return;
+                    };
                     self.study.plan = Some(plans::Progress::new(p.id));
-                    let _ = self.study.save();
+                    self.save();
                     self.list_index = 0;
                     self.set_status(format!("Started: {}", p.name));
                 }
@@ -1562,7 +2365,11 @@ impl App {
             KeyCode::Esc | KeyCode::Char('q') | KeyCode::Char('r') => self.mode = Mode::Read,
             KeyCode::Enter => {
                 if let Some((b, c)) = readings.get(self.list_index) {
-                    self.jump_position(Position { book: *b, chapter: *c, verse: 1 });
+                    self.jump_position(Position {
+                        book: *b,
+                        chapter: *c,
+                        verse: 1,
+                    });
                 }
             }
             KeyCode::Char('x') | KeyCode::Char(' ') => {
@@ -1570,7 +2377,7 @@ impl App {
                 if !p.done.remove(&(day as u32)) {
                     p.done.insert(day as u32);
                 }
-                let _ = self.study.save();
+                self.save();
             }
             KeyCode::Char('l') | KeyCode::Right | KeyCode::Char('n') => {
                 self.plan_day = Some((day + 1).min(days.saturating_sub(1)));
@@ -1586,7 +2393,7 @@ impl App {
             }
             KeyCode::Char('X') => {
                 self.study.plan = None;
-                let _ = self.study.save();
+                self.save();
                 self.plan_day = None;
                 self.list_index = 0;
                 self.set_status("Reading plan stopped".into());
@@ -1606,7 +2413,8 @@ impl App {
             }
             KeyCode::Up | KeyCode::BackTab => {
                 if !self.dict_results.is_empty() {
-                    self.list_index = (self.list_index + self.dict_results.len() - 1) % self.dict_results.len();
+                    self.list_index =
+                        (self.list_index + self.dict_results.len() - 1) % self.dict_results.len();
                 }
             }
             KeyCode::Backspace => {
@@ -1632,7 +2440,10 @@ impl App {
                 let Some(ws) = &self.word_study else { return };
                 let strong = ws.strong.clone();
                 if ws.occurrences.is_none() {
-                    let occ = self.resources.interlinear.occurrences(&strong, OCCURRENCE_LIMIT);
+                    let occ = self
+                        .resources
+                        .interlinear
+                        .occurrences(&strong, OCCURRENCE_LIMIT);
                     self.word_study.as_mut().unwrap().occurrences = Some(occ);
                 }
                 self.list_index = 0;
@@ -1641,7 +2452,10 @@ impl App {
             KeyCode::Char('y') => {
                 if let Some(ws) = &self.word_study {
                     let text = match &ws.entry {
-                        Some(e) => format!("{} {} ({}) — {}\n{}", e.strong, e.lemma, e.translit, e.gloss, e.meaning),
+                        Some(e) => format!(
+                            "{} {} ({}) — {}\n{}",
+                            e.strong, e.lemma, e.translit, e.gloss, e.meaning
+                        ),
                         None => ws.strong.clone(),
                     };
                     match Self::copy_to_clipboard(&text) {
@@ -1655,7 +2469,12 @@ impl App {
     }
 
     fn key_occurrences(&mut self, key: KeyEvent) {
-        let n = self.word_study.as_ref().and_then(|w| w.occurrences.as_ref()).map(|o| o.1.len()).unwrap_or(0);
+        let n = self
+            .word_study
+            .as_ref()
+            .and_then(|w| w.occurrences.as_ref())
+            .map(|o| o.1.len())
+            .unwrap_or(0);
         if self.list_nav(&key, n) {
             return;
         }
@@ -1679,7 +2498,12 @@ impl App {
 
 fn clean_md(s: &str) -> String {
     s.lines()
-        .map(|l| l.trim_start_matches('#').trim().replace("**", "").replace("* ", "• "))
+        .map(|l| {
+            l.trim_start_matches('#')
+                .trim()
+                .replace("**", "")
+                .replace("* ", "• ")
+        })
         .collect::<Vec<_>>()
         .join("\n")
 }
@@ -1687,12 +2511,72 @@ fn clean_md(s: &str) -> String {
 /// TSK book abbreviations → book number.
 fn tsk_book(abbr: &str) -> Option<u32> {
     const T: [(&str, u32); 66] = [
-        ("Ge", 1), ("Ex", 2), ("Le", 3), ("Nu", 4), ("De", 5), ("Jos", 6), ("Jud", 7), ("Ru", 8), ("1Sa", 9), ("2Sa", 10), ("1Ki", 11), ("2Ki", 12),
-        ("1Ch", 13), ("2Ch", 14), ("Ezr", 15), ("Ne", 16), ("Es", 17), ("Job", 18), ("Ps", 19), ("Pr", 20), ("Ec", 21), ("So", 22), ("Isa", 23),
-        ("Jer", 24), ("La", 25), ("Eze", 26), ("Da", 27), ("Ho", 28), ("Joe", 29), ("Am", 30), ("Ob", 31), ("Jon", 32), ("Mic", 33), ("Na", 34),
-        ("Hab", 35), ("Zep", 36), ("Hag", 37), ("Zec", 38), ("Mal", 39), ("Mt", 40), ("Mr", 41), ("Lu", 42), ("Joh", 43), ("Ac", 44), ("Ro", 45),
-        ("1Co", 46), ("2Co", 47), ("Ga", 48), ("Eph", 49), ("Php", 50), ("Col", 51), ("1Th", 52), ("2Th", 53), ("1Ti", 54), ("2Ti", 55), ("Tit", 56),
-        ("Phm", 57), ("Heb", 58), ("Jas", 59), ("1Pe", 60), ("2Pe", 61), ("1Jo", 62), ("2Jo", 63), ("3Jo", 64), ("Jude", 65), ("Re", 66),
+        ("Ge", 1),
+        ("Ex", 2),
+        ("Le", 3),
+        ("Nu", 4),
+        ("De", 5),
+        ("Jos", 6),
+        ("Jud", 7),
+        ("Ru", 8),
+        ("1Sa", 9),
+        ("2Sa", 10),
+        ("1Ki", 11),
+        ("2Ki", 12),
+        ("1Ch", 13),
+        ("2Ch", 14),
+        ("Ezr", 15),
+        ("Ne", 16),
+        ("Es", 17),
+        ("Job", 18),
+        ("Ps", 19),
+        ("Pr", 20),
+        ("Ec", 21),
+        ("So", 22),
+        ("Isa", 23),
+        ("Jer", 24),
+        ("La", 25),
+        ("Eze", 26),
+        ("Da", 27),
+        ("Ho", 28),
+        ("Joe", 29),
+        ("Am", 30),
+        ("Ob", 31),
+        ("Jon", 32),
+        ("Mic", 33),
+        ("Na", 34),
+        ("Hab", 35),
+        ("Zep", 36),
+        ("Hag", 37),
+        ("Zec", 38),
+        ("Mal", 39),
+        ("Mt", 40),
+        ("Mr", 41),
+        ("Lu", 42),
+        ("Joh", 43),
+        ("Ac", 44),
+        ("Ro", 45),
+        ("1Co", 46),
+        ("2Co", 47),
+        ("Ga", 48),
+        ("Eph", 49),
+        ("Php", 50),
+        ("Col", 51),
+        ("1Th", 52),
+        ("2Th", 53),
+        ("1Ti", 54),
+        ("2Ti", 55),
+        ("Tit", 56),
+        ("Phm", 57),
+        ("Heb", 58),
+        ("Jas", 59),
+        ("1Pe", 60),
+        ("2Pe", 61),
+        ("1Jo", 62),
+        ("2Jo", 63),
+        ("3Jo", 64),
+        ("Jude", 65),
+        ("Re", 66),
     ];
     T.iter().find(|(a, _)| *a == abbr).map(|(_, n)| *n)
 }
@@ -1702,9 +2586,13 @@ pub fn parse_tsk(raw: &str, here: Position) -> Vec<(Position, String)> {
     let mut out = Vec::new();
     let mut rest = raw;
     while let Some(s) = rest.find("<scripRef") {
-        let Some(open_end) = rest[s..].find('>') else { break };
+        let Some(open_end) = rest[s..].find('>') else {
+            break;
+        };
         let body_start = s + open_end + 1;
-        let Some(close) = rest[body_start..].find("</scripRef>") else { break };
+        let Some(close) = rest[body_start..].find("</scripRef>") else {
+            break;
+        };
         let body = &rest[body_start..body_start + close];
         rest = &rest[body_start + close..];
         let mut book = here.book;
@@ -1716,11 +2604,11 @@ pub fn parse_tsk(raw: &str, here: Position) -> Vec<(Position, String)> {
             }
             let mut parts = token.rsplitn(2, ' ');
             let nums = parts.next().unwrap_or("");
-            if let Some(b) = parts.next() {
-                if let Some(nr) = tsk_book(b.trim()) {
-                    book = nr;
-                    chapter = 0;
-                }
+            if let Some(b) = parts.next()
+                && let Some(nr) = tsk_book(b.trim())
+            {
+                book = nr;
+                chapter = 0;
             }
             for piece in nums.split(',') {
                 let piece = piece.trim();
@@ -1734,11 +2622,21 @@ pub fn parse_tsk(raw: &str, here: Position) -> Vec<(Position, String)> {
                 if chapter == 0 {
                     continue;
                 }
-                let v: u32 = v.split('-').next().unwrap_or("").trim().parse().unwrap_or(0);
+                let v: u32 = v
+                    .split('-')
+                    .next()
+                    .unwrap_or("")
+                    .trim()
+                    .parse()
+                    .unwrap_or(0);
                 if v == 0 {
                     continue;
                 }
-                let p = Position { book, chapter, verse: v };
+                let p = Position {
+                    book,
+                    chapter,
+                    verse: v,
+                };
                 if p != here && !out.iter().any(|(q, _)| *q == p) {
                     out.push((p, String::new()));
                 }
@@ -1753,11 +2651,285 @@ mod tests {
     use super::*;
 
     #[test]
+    fn stale_load_results_and_canceled_parallel_loads_are_discarded() {
+        let mut app = App::new();
+        app.study = Study::default();
+        let first = app.begin_load(Slot::Primary);
+        let latest = app.begin_load(Slot::Primary);
+        let canceled = app.begin_load(Slot::Parallel);
+        app.clear_parallel();
+        let offline = |id: &str| {
+            let mut t = providers::open("net").unwrap();
+            t.abbreviation = id.into();
+            t.online = None;
+            t
+        };
+        for (generation, abbr, slot) in [
+            (latest, "latest", Slot::Primary),
+            (first, "old", Slot::Primary),
+            (canceled, "canceled", Slot::Parallel),
+        ] {
+            app.tx
+                .send(Msg::Loaded {
+                    generation,
+                    abbr: abbr.into(),
+                    slot,
+                    result: Ok(offline(abbr)),
+                })
+                .unwrap();
+        }
+        app.poll_messages();
+        assert_eq!(app.translation.as_ref().unwrap().abbreviation, "latest");
+        assert!(app.parallel.is_none());
+        assert!(app.busy.is_none());
+    }
+
+    #[test]
+    fn worker_panics_become_reportable_failures() {
+        let result = worker::<()>(|| panic!("simulated worker failure"));
+        assert!(result.unwrap_err().contains("Please try again"));
+    }
+
+    #[test]
+    fn draft_restores_and_failed_note_save_keeps_editor_open() {
+        let dir = crate::storage::TestDir::new();
+        let path = dir.0.join("study.json");
+        let mut app = online_app();
+        app.translation.as_mut().unwrap().online = None;
+        app.study = Study::load_from(path.clone());
+        app.mode = Mode::Note;
+        app.note_buffer = "unfinished thought".into();
+        assert!(app.save());
+        let mut restored = App::new();
+        restored.study = Study::load_from(path.clone());
+        let t = app.translation.take().unwrap();
+        restored.install_translation(t, Slot::Primary);
+        assert_eq!(restored.mode, Mode::Note);
+        assert_eq!(restored.note_buffer, "unfinished thought");
+        // Simulate an external write while this window is editing.
+        fs_write_external(&path);
+        restored.key_note(KeyEvent::new(KeyCode::Char('s'), KeyModifiers::CONTROL));
+        assert_eq!(restored.mode, Mode::Note);
+        assert!(restored.save_error.is_some());
+        assert_eq!(restored.note_buffer, "unfinished thought");
+        fn fs_write_external(path: &std::path::Path) {
+            std::fs::write(path, b"{}").unwrap();
+        }
+    }
+
+    #[test]
+    fn exit_before_translation_load_preserves_last_position() {
+        let dir = crate::storage::TestDir::new();
+        let path = dir.0.join("study.json");
+        let mut app = App::new();
+        app.study = Study::load_from(path.clone());
+        let position = Position {
+            book: 43,
+            chapter: 3,
+            verse: 16,
+        };
+        app.study.last = Some(position);
+        assert!(app.save());
+        assert_eq!(Study::load_from(path).last, Some(position));
+    }
+
+    fn online_app() -> App {
+        let mut app = App::new();
+        app.study = Study::default();
+        app.sidebar = 0;
+        app.translation = Some(providers::open("net").unwrap());
+        app.loc = Loc {
+            book: 42,
+            chapter: 2,
+            verse: 15,
+        };
+        app
+    }
+    fn passage() -> Result<providers::Passage, String> {
+        Ok(providers::Passage {
+            verses: vec![
+                crate::bible::Verse {
+                    verse: 16,
+                    text: "Test passage".into(),
+                },
+                crate::bible::Verse {
+                    verse: 18,
+                    text: "Another verse".into(),
+                },
+            ],
+            notice: "Test attribution".into(),
+        })
+    }
+    #[test]
+    fn online_response_preserves_selected_verse_and_ignores_stale_results() {
+        let mut app = online_app();
+        app.accept_chapter("net", Slot::Primary, 42, 1, passage());
+        assert!(
+            app.translation
+                .as_ref()
+                .unwrap()
+                .online
+                .as_ref()
+                .unwrap()
+                .loaded
+                .is_none()
+        );
+        app.accept_chapter("esv", Slot::Primary, 42, 2, passage());
+        assert!(
+            app.translation
+                .as_ref()
+                .unwrap()
+                .online
+                .as_ref()
+                .unwrap()
+                .loaded
+                .is_none()
+        );
+        app.accept_chapter("net", Slot::Primary, 42, 2, passage());
+        assert_eq!(app.loc.verse, 0);
+        assert_eq!(
+            app.translation
+                .as_ref()
+                .unwrap()
+                .position_from_loc(app.loc)
+                .verse,
+            16
+        );
+        assert_eq!(
+            app.translation.as_ref().unwrap().verse_text(app.loc),
+            Some("Test passage")
+        );
+    }
+    #[test]
+    fn online_error_renders_and_retry_evicts_old_text() {
+        let mut app = online_app();
+        app.accept_chapter(
+            "net",
+            Slot::Primary,
+            42,
+            2,
+            Err("Test connection failure".into()),
+        );
+        let mut terminal =
+            ratatui::Terminal::new(ratatui::backend::TestBackend::new(100, 30)).unwrap();
+        terminal.draw(|f| crate::ui::draw(f, &mut app)).unwrap();
+        let screen: String = terminal
+            .backend()
+            .buffer()
+            .content()
+            .iter()
+            .map(|c| c.symbol())
+            .collect();
+        assert!(screen.contains("Test connection failure"));
+        assert!(
+            app.translation
+                .as_ref()
+                .unwrap()
+                .verse_text(app.loc)
+                .is_none()
+        );
+        app.accept_chapter("net", Slot::Primary, 42, 2, passage());
+        app.handle_key(KeyEvent::new(KeyCode::F(5), KeyModifiers::NONE));
+        let t = app.translation.as_ref().unwrap();
+        assert!(t.online.as_ref().unwrap().loaded.is_none());
+        assert_eq!(t.position_from_loc(app.loc).verse, 16);
+        assert!(
+            t.books[42].chapters[2]
+                .verses
+                .iter()
+                .all(|v| v.text.is_empty())
+        );
+    }
+    #[test]
+    fn online_back_history_survives_chapter_eviction() {
+        let mut app = online_app();
+        app.accept_chapter("net", Slot::Primary, 42, 2, passage());
+        app.push_history();
+        app.translation.as_mut().unwrap().books[42].chapters[2] = providers::placeholder(42, 2);
+        app.loc = Loc {
+            book: 42,
+            chapter: 3,
+            verse: 0,
+        };
+        app.handle_key(KeyEvent::new(KeyCode::Char('u'), KeyModifiers::NONE));
+        assert_eq!(
+            app.position(),
+            Some(Position {
+                book: 43,
+                chapter: 3,
+                verse: 16
+            })
+        );
+    }
+
+    #[test]
+    fn online_parallel_response_does_not_move_primary_selection() {
+        let mut app = online_app();
+        app.parallel = Some(providers::open("nlt").unwrap());
+        app.parallel_visible = true;
+        let loc = app.loc;
+        app.accept_chapter("nlt", Slot::Parallel, 42, 2, passage());
+        assert_eq!(app.loc, loc);
+        assert_eq!(
+            app.parallel
+                .as_ref()
+                .unwrap()
+                .online
+                .as_ref()
+                .unwrap()
+                .loaded,
+            Some((42, 2))
+        );
+        app.parallel_visible = false;
+        app.accept_chapter("nlt", Slot::Parallel, 42, 2, Err("late error".into()));
+        assert!(
+            app.parallel
+                .as_ref()
+                .unwrap()
+                .online
+                .as_ref()
+                .unwrap()
+                .error
+                .is_none()
+        );
+    }
+    #[test]
+    fn online_rendering_handles_small_and_wide_terminals() {
+        let mut app = online_app();
+        app.accept_chapter("net", Slot::Primary, 42, 2, passage());
+        for (w, h) in [(20, 8), (80, 24), (150, 40)] {
+            let mut terminal =
+                ratatui::Terminal::new(ratatui::backend::TestBackend::new(w, h)).unwrap();
+            terminal.draw(|f| crate::ui::draw(f, &mut app)).unwrap();
+            if w >= 80 {
+                let screen: String = terminal
+                    .backend()
+                    .buffer()
+                    .content()
+                    .iter()
+                    .map(|c| c.symbol())
+                    .collect();
+                assert!(screen.contains("Test passage"));
+                assert!(screen.contains("Test attribution"));
+            }
+        }
+    }
+
+    #[test]
     fn parses_tsk_refs() {
         let raw = "whosoever.<br /><scripRef>16,36; 1:12; Isa 45:22; Mr 16:16</scripRef><br /><scripRef>1Jo 5:1,11-13</scripRef>";
-        let here = Position { book: 43, chapter: 3, verse: 16 };
+        let here = Position {
+            book: 43,
+            chapter: 3,
+            verse: 16,
+        };
         let refs = parse_tsk(raw, here);
         let keys: Vec<String> = refs.iter().map(|(p, _)| p.key()).collect();
-        assert_eq!(keys, vec!["43:3:36", "43:1:12", "23:45:22", "41:16:16", "62:5:1", "62:5:11"]);
+        assert_eq!(
+            keys,
+            vec![
+                "43:3:36", "43:1:12", "23:45:22", "41:16:16", "62:5:1", "62:5:11"
+            ]
+        );
     }
 }

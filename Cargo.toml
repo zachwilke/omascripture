@@ -1,11 +1,11 @@
 [package]
 name = "omascripture"
-version = "0.2.0"
+version = "0.6.2"
 edition = "2024"
-description = "Read and study the Bible in your terminal, built for Omarchy"
+description = "Read and study the Bible on your desktop, built for Omarchy"
 license = "MIT"
 readme = "README.md"
-keywords = ["bible", "tui", "omarchy", "scripture"]
+keywords = ["bible", "gui", "omarchy", "scripture"]
 categories = ["command-line-utilities"]
 
 [profile.release]
@@ -16,10 +16,14 @@ strip = true
 [dependencies]
 crossterm = "0.29.0"
 dirs = "7.0.0"
+eframe = { version = "0.33", default-features = false, features = ["default_fonts", "glow", "wayland", "x11", "accesskit"] }
 flate2 = "1.1.10"
+quick-xml = "0.38"
 ratatui = "0.30.2"
+scraper = { version = "0.24.0", default-features = false }
 serde = { version = "1.0.229", features = ["derive"] }
 serde_json = "1.0.151"
+toml = { version = "0.9", default-features = false, features = ["parse", "serde"] }
 unicode-width = "0.2.2"
 ureq = { version = "3.4.1", default-features = false, features = ["rustls"] }
 zip = { version = "8.6.0", default-features = false, features = ["deflate"] }

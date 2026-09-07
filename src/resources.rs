@@ -18,6 +18,7 @@ const STEP_BASE: &str = "https://raw.githubusercontent.com/STEPBible/STEPBible-D
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Kind {
+    WordData,
     CrossRefs,
     InterlinearNT,
     InterlinearOT,
@@ -32,6 +33,7 @@ pub enum Kind {
 impl Kind {
     pub fn label(self) -> &'static str {
         match self {
+            Kind::WordData => "Word studies",
             Kind::CrossRefs => "Cross-references",
             Kind::InterlinearNT | Kind::InterlinearOT => "Interlinear",
             Kind::LexiconGreek | Kind::LexiconHebrew => "Lexicon",
@@ -55,6 +57,11 @@ pub struct Pack {
 }
 
 pub const PACKS: &[Pack] = &[
+    Pack { id: "word-study", name: "Word study language data", description: "Tagged KJV phrase alignment and expanded Greek/Hebrew morphology", license: "CrossWire permission for any purpose; STEPBible CC BY 4.0", size: "29 MB", kind: Kind::WordData, urls: &[
+        "https://gitlab.com/crosswire-bible-society/kjv/-/raw/master/kjv.osis.xml",
+        "Morphology codes/TEGMC - Translators Expansion of Greek Morphhology Codes - STEPBible.org CC BY.txt",
+        "Morphology codes/TEHMC - Translators Expansion of Hebrew Morphology Codes - STEPBible.org CC BY.txt",
+    ] },
     Pack { id: "crossrefs", name: "OpenBible cross-references", description: "340,000 weighted cross-references, incorporating the Treasury of Scripture Knowledge", license: "CC BY (openbible.info)", size: "3 MB", kind: Kind::CrossRefs, urls: &["https://a.openbible.info/data/cross-references.zip"] },
     Pack { id: "tsk", name: "Treasury of Scripture Knowledge", description: "Classic verse-by-verse cross-reference commentary (1880)", license: "Public domain", size: "3 MB", kind: Kind::Commentary, urls: &["TSK"] },
     Pack { id: "interlinear-nt", name: "Greek NT interlinear (STEPBible TAGNT)", description: "Every Greek word with Strong's number, morphology and gloss, NA28/KJV text", license: "CC BY 4.0 (Tyndale House)", size: "29 MB", kind: Kind::InterlinearNT, urls: &[
@@ -106,6 +113,10 @@ pub fn installed_ids() -> Vec<&'static str> {
 }
 
 pub fn remove(id: &str) -> io::Result<()> {
+    if pack(id).is_none() { return Err(io::Error::new(io::ErrorKind::InvalidInput, "Unknown resource ID")); }
+    let lock = fs::OpenOptions::new().write(true).create(true).truncate(false)
+        .open(resources_dir().join(format!(".{id}.lock")))?;
+    lock.try_lock().map_err(|_| io::Error::other("This resource is being installed in another window"))?;
     fs::remove_dir_all(pack_dir(id))
 }
 
@@ -157,11 +168,23 @@ fn encode_path(p: &str) -> String {
 pub fn install(id: &str) -> Result<(), String> {
     let p = pack(id).ok_or_else(|| format!("unknown resource '{id}'"))?;
     let dir = pack_dir(id);
+    fs::create_dir_all(resources_dir()).map_err(|e| e.to_string())?;
+    let lock = fs::OpenOptions::new().write(true).create(true).truncate(false)
+        .open(resources_dir().join(format!(".{id}.lock"))).map_err(|e| e.to_string())?;
+    lock.try_lock().map_err(|_| "This resource is being installed in another window".to_string())?;
+    let previous = resources_dir().join(format!(".{id}.previous"));
+    if !dir.exists() && previous.exists() { fs::rename(&previous, &dir).map_err(|e| e.to_string())?; }
     let tmp = resources_dir().join(format!(".{id}.partial"));
     let _ = fs::remove_dir_all(&tmp);
     fs::create_dir_all(&tmp).map_err(|e| e.to_string())?;
     let result = (|| -> Result<(), String> {
         match p.kind {
+            Kind::WordData => {
+                crate::word_data::import_kjv(&get_bytes(p.urls[0])?, &tmp)?;
+                for (url, file) in p.urls[1..].iter().zip(["greek.tsv", "hebrew.tsv"]) {
+                    fs::write(tmp.join(file), get_bytes(&format!("{STEP_BASE}/{}", encode_path(url)))?).map_err(|e| e.to_string())?;
+                }
+            }
             Kind::CrossRefs => {
                 let zip = get_bytes(p.urls[0])?;
                 extract_zip(&zip, &tmp, |n| n.ends_with(".txt"))?;
@@ -194,10 +217,7 @@ pub fn install(id: &str) -> Result<(), String> {
         Ok(())
     })();
     match result {
-        Ok(()) => {
-            let _ = fs::remove_dir_all(&dir);
-            fs::rename(&tmp, &dir).map_err(|e| e.to_string())
-        }
+        Ok(()) => publish_resource(&tmp, &dir, &resources_dir().join(format!(".{id}.previous"))),
         Err(e) => {
             let _ = fs::remove_dir_all(&tmp);
             Err(e)
@@ -205,11 +225,28 @@ pub fn install(id: &str) -> Result<(), String> {
     }
 }
 
+fn publish_resource(staged: &std::path::Path, destination: &std::path::Path, previous: &std::path::Path) -> Result<(), String> {
+    if destination.exists() {
+        if previous.exists() { fs::remove_dir_all(previous).map_err(|e| e.to_string())?; }
+        fs::rename(destination, previous).map_err(|e| e.to_string())?;
+    }
+    if let Err(e) = fs::rename(staged, destination) {
+        if previous.exists() { let _ = fs::rename(previous, destination); }
+        return Err(e.to_string());
+    }
+    let _ = fs::remove_dir_all(previous);
+    Ok(())
+}
+
 fn extract_zip(bytes: &[u8], dest: &std::path::Path, keep: impl Fn(&str) -> bool) -> Result<(), String> {
     let cursor = io::Cursor::new(bytes);
     let mut archive = zip::ZipArchive::new(cursor).map_err(|e| e.to_string())?;
+    if archive.len() > 100_000 { return Err("Archive has too many entries".into()); }
+    let mut expanded = 0u64;
     for i in 0..archive.len() {
-        let mut f = archive.by_index(i).map_err(|e| e.to_string())?;
+        let f = archive.by_index(i).map_err(|e| e.to_string())?;
+        expanded = expanded.checked_add(f.size()).ok_or("Archive is too large")?;
+        if f.size() > 128 * 1024 * 1024 || expanded > 1024 * 1024 * 1024 { return Err("Archive exceeds expanded size limit".into()); }
         if f.is_dir() || !keep(f.name()) {
             continue;
         }
@@ -219,7 +256,8 @@ fn extract_zip(bytes: &[u8], dest: &std::path::Path, keep: impl Fn(&str) -> bool
             fs::create_dir_all(parent).map_err(|e| e.to_string())?;
         }
         let mut buf = Vec::new();
-        f.read_to_end(&mut buf).map_err(|e| e.to_string())?;
+        f.take(128 * 1024 * 1024 + 1).read_to_end(&mut buf).map_err(|e| e.to_string())?;
+        if buf.len() > 128 * 1024 * 1024 { return Err("Archive entry exceeds size limit".into()); }
         fs::write(&out, buf).map_err(|e| e.to_string())?;
     }
     Ok(())
@@ -266,14 +304,19 @@ fn build_words_json(zip_bytes: &[u8], dest: &std::path::Path) -> Result<(), Stri
     let cursor = io::Cursor::new(zip_bytes);
     let mut archive = zip::ZipArchive::new(cursor).map_err(|e| e.to_string())?;
     let mut words: BTreeMap<String, UwWord> = BTreeMap::new();
+    if archive.len() > 100_000 { return Err("Archive has too many entries".into()); }
+    let mut expanded = 0u64;
     for i in 0..archive.len() {
-        let mut f = archive.by_index(i).map_err(|e| e.to_string())?;
+        let f = archive.by_index(i).map_err(|e| e.to_string())?;
+        expanded = expanded.checked_add(f.size()).ok_or("Archive is too large")?;
+        if f.size() > 128 * 1024 * 1024 || expanded > 1024 * 1024 * 1024 { return Err("Archive exceeds expanded size limit".into()); }
         let name = f.name().to_string();
         if !name.contains("/bible/") || !name.ends_with(".md") {
             continue;
         }
         let mut text = String::new();
-        f.read_to_string(&mut text).map_err(|e| e.to_string())?;
+        f.take(8 * 1024 * 1024 + 1).read_to_string(&mut text).map_err(|e| e.to_string())?;
+        if text.len() > 8 * 1024 * 1024 { return Err("Dictionary entry exceeds size limit".into()); }
         let slug = name.rsplit('/').next().unwrap_or("").trim_end_matches(".md").to_string();
         let category = if name.contains("/kt/") { "key term" } else if name.contains("/names/") { "name" } else { "other" };
         let title = text.lines().next().unwrap_or("").trim_start_matches('#').trim().to_string();
@@ -310,11 +353,10 @@ impl CrossRefs {
     pub fn load() -> io::Result<CrossRefs> {
         let dir = pack_dir("crossrefs");
         let mut path = dir.join("cross_references.txt");
-        if !path.exists() {
-            if let Some(p) = fs::read_dir(&dir)?.flatten().map(|e| e.path()).find(|p| p.extension().map(|e| e == "txt").unwrap_or(false)) {
+        if !path.exists()
+            && let Some(p) = fs::read_dir(&dir)?.flatten().map(|e| e.path()).find(|p| p.extension().map(|e| e == "txt").unwrap_or(false)) {
                 path = p;
             }
-        }
         let text = fs::read_to_string(path)?;
         let mut map: HashMap<Position, Vec<CrossRef>> = HashMap::new();
         for line in text.lines().skip(1) {
@@ -331,7 +373,7 @@ impl CrossRefs {
             map.entry(from).or_default().push(CrossRef { to, to_end, votes });
         }
         for v in map.values_mut() {
-            v.sort_by(|a, b| b.votes.cmp(&a.votes));
+            v.sort_by_key(|r| std::cmp::Reverse(r.votes));
         }
         Ok(CrossRefs { map })
     }
@@ -363,6 +405,17 @@ pub struct Word {
 pub struct Interlinear {
     books: HashMap<u32, Vec<Word>>,
     missing: HashMap<u32, bool>,
+    last_book: Option<u32>,
+    last_verse: Option<(Position, Vec<Word>)>,
+}
+
+/// Retain the current and previous book for navigation/parallel study, without
+/// allowing a long reading session to accumulate the entire corpus in RAM.
+fn retain_recent_books<T>(books: &mut HashMap<u32, T>, book: u32, previous: &mut Option<u32>) {
+    if *previous != Some(book) {
+        books.retain(|key, _| *key == book || Some(*key) == *previous);
+        *previous = Some(book);
+    }
 }
 
 fn strip_braces(s: &str) -> String {
@@ -387,12 +440,11 @@ pub fn strongs_in(tag: &str) -> Vec<String> {
 
 /// Primary Strong's number of a tag: the braced one if present, else the last.
 pub fn main_strong(tag: &str) -> String {
-    if let Some(start) = tag.find('{') {
-        if let Some(end) = tag[start..].find('}') {
+    if let Some(start) = tag.find('{')
+        && let Some(end) = tag[start..].find('}') {
             let inner = &tag[start + 1..start + end];
             return strongs_in(inner).into_iter().next().unwrap_or_default();
         }
-    }
     strongs_in(tag).into_iter().last().unwrap_or_default()
 }
 
@@ -417,7 +469,16 @@ pub fn base_strong(s: &str) -> String {
 }
 
 impl Interlinear {
+    #[cfg(test)]
+    pub(crate) fn test_book(book: u32, text: &str) -> Self {
+        let mut interlinear = Self::default();
+        interlinear.books.insert(book, if book >= 40 { parse_tagnt(text) } else { parse_tahot(text) });
+        interlinear.missing.extend((1..=66).map(|b| (b, true)));
+        interlinear
+    }
+
     fn ensure(&mut self, book: u32) {
+        retain_recent_books(&mut self.books, book, &mut self.last_book);
         if self.books.contains_key(&book) || self.missing.contains_key(&book) {
             return;
         }
@@ -435,13 +496,48 @@ impl Interlinear {
     }
 
     pub fn verse(&mut self, pos: Position) -> Vec<Word> {
+        if let Some((cached, words)) = &self.last_verse
+            && *cached == pos {
+            return words.clone();
+        }
         self.ensure(pos.book);
-        self.books
+        let words: Vec<Word> = self.books
             .get(&pos.book)
             .map(|ws| ws.iter().filter(|w| w.chapter == pos.chapter && w.verse == pos.verse).cloned().collect())
-            .unwrap_or_default()
+            .unwrap_or_default();
+        self.last_verse = Some((pos, words.clone()));
+        words
     }
 
+
+    pub fn report(&self, strong: &str, limit: usize) -> crate::word_data::WordReport {
+        let mut report = crate::word_data::WordReport::default();
+        let greek = strong.starts_with('G');
+        let base = base_strong(strong);
+        let extended = strong != base;
+        let mut verses = std::collections::HashSet::new();
+        for b in if greek { 40..=66 } else { 1..=39 } {
+            // A corpus scan must not fill the interactive reader's book cache.
+            // Each temporary book is released before loading the next one.
+            let loaded = if self.books.contains_key(&b) || self.missing.contains_key(&b) {
+                None
+            } else {
+                let id = if greek { "interlinear-nt" } else { "interlinear-ot" };
+                fs::read_to_string(pack_dir(id).join(format!("{b}.tsv"))).ok()
+                    .map(|text| if greek { parse_tagnt(&text) } else { parse_tahot(&text) })
+            };
+            let Some(words) = self.books.get(&b).or(loaded.as_ref()) else { continue };
+            report.loaded_books += 1;
+            for w in words.iter().filter(|w| !w.variant && if extended { w.strong == strong } else { base_strong(&w.strong) == base }) {
+                report.total += 1;
+                *report.book_counts.entry(b).or_default() += 1;
+                *report.forms.entry(w.text.trim_matches(|c: char| !c.is_alphanumeric() && !(0x0300..=0x036f).contains(&(c as u32))).to_string()).or_default() += 1;
+                let pos = Position { book: b, chapter: w.chapter, verse: w.verse };
+                if verses.insert(pos) && report.verses.len() < limit { report.verses.push((pos, w.gloss.clone())); }
+            }
+        }
+        report.verse_count = verses.len(); report
+    }
 
     /// All verses across installed books containing a Strong's number.
     pub fn occurrences(&mut self, strong: &str, limit: usize) -> (usize, Vec<(Position, String)>) {
@@ -633,6 +729,7 @@ pub struct Note {
 pub struct UwNotes {
     books: HashMap<u32, Vec<Note>>,
     missing: HashMap<u32, bool>,
+    last_book: Option<u32>,
 }
 
 pub const USFM_BOOKS: [&str; 66] = [
@@ -654,6 +751,7 @@ fn clean_markdown(s: &str) -> String {
 
 impl UwNotes {
     fn ensure(&mut self, book: u32) {
+        retain_recent_books(&mut self.books, book, &mut self.last_book);
         if self.books.contains_key(&book) || self.missing.contains_key(&book) {
             return;
         }
@@ -757,6 +855,7 @@ pub struct Store {
     lex_greek: Option<Result<Lexicon, String>>,
     lex_hebrew: Option<Result<Lexicon, String>>,
     commentaries: HashMap<String, Result<Commentary, String>>,
+    last_commentary: Option<String>,
     dictionaries: HashMap<String, Result<Dictionary, String>>,
     pub notes: UwNotes,
     words: Option<Result<UwWords, String>>,
@@ -786,6 +885,10 @@ impl Store {
     }
 
     pub fn commentary(&mut self, id: &str) -> Option<&Commentary> {
+        if self.last_commentary.as_deref() != Some(id) {
+            self.commentaries.retain(|key, _| key == id || Some(key.as_str()) == self.last_commentary.as_deref());
+            self.last_commentary = Some(id.to_string());
+        }
         if !self.commentaries.contains_key(id) {
             if !is_installed(id) {
                 return None;
@@ -826,6 +929,80 @@ impl Store {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn browsing_books_keeps_only_current_and_previous() {
+        let mut books = HashMap::new();
+        let mut previous = None;
+        for book in 1..=66 {
+            retain_recent_books(&mut books, book, &mut previous);
+            books.entry(book).or_insert(book);
+            assert!(books.len() <= 2);
+            assert_eq!(books.get(&book), Some(&book));
+            if book > 1 { assert!(books.contains_key(&(book - 1))); }
+        }
+        retain_recent_books(&mut books, 65, &mut previous);
+        assert!(books.contains_key(&66));
+        retain_recent_books(&mut books, 64, &mut previous);
+        books.insert(64, 64);
+        assert!(books.contains_key(&65));
+        assert!(!books.contains_key(&66));
+    }
+
+    #[test]
+    fn cached_verse_tracks_navigation_and_returns_independent_words() {
+        let mut reader = Interlinear::test_book(43,
+            "Jhn.3.16#01=NKO\tἠγάπησεν (ēgapēsen)\tloved\tG0025=V-AAI-3S\tἀγαπάω=to love\nJhn.3.17#01=NKO\tθεός (theos)\tGod\tG2316=N-NSM\tθεός=God\n");
+        let pos = Position { book: 43, chapter: 3, verse: 16 };
+        let mut words = reader.verse(pos);
+        words[0].gloss = "modified by caller".into();
+        assert_eq!(reader.verse(pos)[0].gloss, "loved");
+        assert_eq!(reader.verse(Position { verse: 17, ..pos })[0].gloss, "God");
+        assert_eq!(reader.verse(pos)[0].gloss, "loved");
+    }
+
+    /// Run separately for each corpus so VmHWM measures that scan, not earlier tests.
+    #[test]
+    #[ignore = "performance diagnostic requiring installed interlinear packs"]
+    fn profile_installed_word_report() {
+        let strong = std::env::var("OMASCRIPTURE_PROFILE_STRONG").unwrap_or("G0025".into());
+        let start = std::time::Instant::now();
+        let reader = Interlinear::default();
+        let report = reader.report(&strong, crate::app::OCCURRENCE_LIMIT);
+        assert!(report.loaded_books > 0, "Install the interlinear corpus first");
+        println!("{strong}: {} occurrences, {} verses, {} books, {:?}, {} retained books",
+            report.total, report.verse_count, report.loaded_books, start.elapsed(), reader.books.len());
+        if let Ok(status) = std::fs::read_to_string("/proc/self/status") {
+            for line in status.lines().filter(|line| line.starts_with("VmHWM:") || line.starts_with("VmRSS:")) {
+                println!("{line}");
+            }
+        }
+    }
+
+    #[test]
+    fn usage_counts_tokens_and_unique_verses_without_variant_double_counting() {
+        let source = "Jhn.1.1#01=NKO\tλόγος (logos)\tword\tG3056=N-NSM\tλόγος=word\nJhn.1.1#02=NKO\tλόγον (logon)\tword\tG3056=N-ASM\tλόγος=word\nJhn.1.2#01=KO\tλόγος (logos)\tword\tG3056=N-NSM\tλόγος=word\n";
+        let interlinear = Interlinear::test_book(43, source);
+        let report = interlinear.report("G3056", 1);
+        assert_eq!(report.total, 2); assert_eq!(report.verse_count, 1);
+        assert_eq!(report.loaded_books, 1); assert_eq!(report.forms.len(), 2);
+        assert_eq!(report.verses.len(), 1);
+    }
+
+    #[test]
+    fn failed_resource_publish_restores_existing_pack() {
+        let dir = crate::storage::TestDir::new();
+        let destination = dir.0.join("resource"); let previous = dir.0.join("previous");
+        fs::create_dir(&destination).unwrap(); fs::write(destination.join("data"), "installed").unwrap();
+        assert!(publish_resource(&dir.0.join("missing-stage"), &destination, &previous).is_err());
+        assert_eq!(fs::read_to_string(destination.join("data")).unwrap(), "installed");
+        assert!(!previous.exists());
+        let staged = dir.0.join("stage"); fs::create_dir(&staged).unwrap(); fs::write(staged.join("data"), "replacement").unwrap();
+        publish_resource(&staged, &destination, &previous).unwrap();
+        assert_eq!(fs::read_to_string(destination.join("data")).unwrap(), "replacement");
+        assert!(!previous.exists());
+        assert!(remove("../outside").is_err());
+    }
 
     #[test]
     fn strong_helpers() {

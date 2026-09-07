@@ -40,7 +40,7 @@ MENU_FILE="$HOME/.config/omarchy/extensions/omarchy-menu.jsonc"
 BINDINGS_FILE="$HOME/.config/hypr/bindings.lua"
 SHELL_JSON="$HOME/.config/omarchy/shell.json"
 SHELL_DEFAULT="${OMARCHY_PATH:-/usr/share/omarchy}/config/omarchy/shell.json"
-APP_ID="org.omarchy.omascripture"
+APP_ID="io.github.zachwilke.OmaScripture"
 
 if ! command -v cargo >/dev/null 2>&1; then
   echo "cargo is required. Install a Rust toolchain first, e.g.:  omarchy install dev-env rust" >&2
@@ -52,7 +52,8 @@ echo "==> Building release binary"
 
 echo "==> Installing binary to $BIN"
 mkdir -p "$BIN_DIR"
-install -m 755 "$HERE/target/release/omascripture" "$BIN"
+install -m 755 "$HERE/target/release/omascripture" "$BIN.next"
+mv -f "$BIN.next" "$BIN"
 
 echo "==> Installing icon"
 mkdir -p "$ICON_DIR"
@@ -60,18 +61,20 @@ install -m 644 "$HERE/assets/omascripture.svg" "$ICON_DIR/omascripture.svg"
 
 echo "==> Installing desktop entry"
 mkdir -p "$APP_DIR"
-cat > "$APP_DIR/OmaScripture.desktop" <<EOF
+rm -f "$APP_DIR/OmaScripture.desktop"
+cat > "$APP_DIR/$APP_ID.desktop" <<EOF
 [Desktop Entry]
 Version=1.0
 Name=OmaScripture
 Comment=Read and study the Bible: translations, interlinear, commentaries, dictionaries
-Exec=xdg-terminal-exec --app-id=$APP_ID -e omascripture
+Exec=$BIN --gui
 Terminal=false
 Type=Application
 Icon=omascripture
 Categories=Education;Literature;
 Keywords=Bible;Scripture;Verse;Study;Greek;Hebrew;Commentary;
 StartupNotify=true
+StartupWMClass=$APP_ID
 EOF
 command -v update-desktop-database >/dev/null 2>&1 && update-desktop-database "$APP_DIR" 2>/dev/null || true
 command -v gtk-update-icon-cache >/dev/null 2>&1 && gtk-update-icon-cache -q "$HOME/.local/share/icons/hicolor" 2>/dev/null || true
@@ -83,9 +86,10 @@ if [[ $ADD_MENU -eq 1 ]]; then
     printf '{\n}\n' > "$MENU_FILE"
   fi
   if grep -q '"learn.bible"' "$MENU_FILE"; then
-    echo "    already present, skipping"
+    echo "    updating existing launcher to the desktop app"
+    sed -i 's/omarchy-launch-or-focus-tui omascripture/omarchy-launch-or-focus io.github.zachwilke.OmaScripture omascripture/g; s/org.omarchy.omascripture/io.github.zachwilke.OmaScripture/g' "$MENU_FILE"
   else
-    ENTRY='  "learn.bible": {"icon":"","label":"Bible","description":"OmaScripture: read and study the Bible","aliases":["bible","scripture","omascripture"],"action":"omarchy-launch-or-focus-tui omascripture"},'
+    ENTRY='  "learn.bible": {"icon":"","label":"Bible","description":"OmaScripture: read and study the Bible","aliases":["bible","scripture","omascripture"],"action":"omarchy-launch-or-focus io.github.zachwilke.OmaScripture omascripture"},'
     LAST=$(grep -n '^}' "$MENU_FILE" | tail -1 | cut -d: -f1)
     if [[ -n "$LAST" ]]; then
       sed -i "${LAST}i\\
@@ -98,10 +102,10 @@ fi
 
 if [[ -n "$BIND" ]]; then
   echo "==> Adding Hyprland binding: $BIND"
-  if grep -q 'tui = "omascripture"' "$BINDINGS_FILE" 2>/dev/null; then
+  if grep -q 'launch = "omascripture"' "$BINDINGS_FILE" 2>/dev/null; then
     echo "    a binding already exists in $BINDINGS_FILE, skipping"
   else
-    printf '\n-- OmaScripture (added by install.sh)\no.bind("%s", "Bible", { tui = "omascripture", focus = true })\n' "$BIND" >> "$BINDINGS_FILE"
+    printf '\n-- OmaScripture (added by install.sh)\no.bind("%s", "Bible", { launch = "omascripture", focus = "io.github.zachwilke.OmaScripture" })\n' "$BIND" >> "$BINDINGS_FILE"
     if command -v hyprctl >/dev/null 2>&1; then
       hyprctl reload >/dev/null 2>&1 || true
       ERRORS=$(hyprctl configerrors 2>/dev/null || true)
@@ -141,7 +145,7 @@ else:
         "exec": f"{binary} --votd-bar",
         "interval": 3600,
         "tooltip": "Verse of the day",
-        "onClick": "omarchy-launch-or-focus-tui omascripture",
+        "onClick": "omarchy-launch-or-focus io.github.zachwilke.OmaScripture omascripture",
     })
     with open(path, "w") as f:
         json.dump(data, f, indent=2)
@@ -179,13 +183,13 @@ esac
 cat <<EOF
 
 Done. Launch OmaScripture with any of:
-  omascripture                       (in a terminal)
+  omascripture                       (desktop app)
   omascripture "John 3:16"           (open at a reference)
-  omarchy launch tui omascripture    (Omarchy-styled terminal window)
+  omascripture --tui                 (optional terminal interface)
   Super+Space → Learn → Bible        (Omarchy menu)
   App launcher → OmaScripture
 
-Inside the app: ? for keys, t to pick a translation, R to add study resources.
+Use the book navigator, Study sidebar, and Settings to make it your own.
 EOF
 if ! echo "$PATH" | tr ':' '\n' | grep -qx "$BIN_DIR"; then
   echo

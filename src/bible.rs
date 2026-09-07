@@ -28,6 +28,8 @@ pub struct TranslationInfo {
 
 #[derive(Debug, Clone, Deserialize)]
 pub struct Translation {
+    #[serde(skip)]
+    pub online: Option<crate::providers::Online>,
     pub translation: String,
     pub abbreviation: String,
     #[serde(default)]
@@ -90,6 +92,40 @@ pub struct SearchHit {
 }
 
 impl Translation {
+    /// Validate the invariants used by navigation before data reaches the UI.
+    pub fn validate(&self, expected_id: &str) -> Result<(), String> {
+        if !valid_id(expected_id) || !self.abbreviation.eq_ignore_ascii_case(expected_id) {
+            return Err("Translation ID does not match the requested Bible".into());
+        }
+        if self.books.is_empty() {
+            return Err("Translation contains no books".into());
+        }
+        let mut books = std::collections::HashSet::new();
+        for book in &self.books {
+            if book.nr == 0 || !books.insert(book.nr) || book.chapters.is_empty() {
+                return Err(format!("Invalid or empty book: {}", book.name));
+            }
+            let mut last_chapter = 0;
+            for chapter in &book.chapters {
+                if chapter.chapter <= last_chapter || chapter.verses.is_empty() {
+                    return Err(format!("Invalid or empty chapter in {}", book.name));
+                }
+                last_chapter = chapter.chapter;
+                let mut last_verse = 0;
+                for verse in &chapter.verses {
+                    if verse.verse <= last_verse {
+                        return Err(format!(
+                            "Invalid verse numbering in {} {}",
+                            book.name, chapter.chapter
+                        ));
+                    }
+                    last_verse = verse.verse;
+                }
+            }
+        }
+        Ok(())
+    }
+
     pub fn info(&self) -> TranslationInfo {
         TranslationInfo {
             abbreviation: self.abbreviation.clone(),
@@ -116,14 +152,22 @@ impl Translation {
             .iter()
             .position(|v| v.verse == p.verse)
             .unwrap_or(0);
-        Some(Loc { book, chapter, verse })
+        Some(Loc {
+            book,
+            chapter,
+            verse,
+        })
     }
 
     pub fn position_from_loc(&self, l: Loc) -> Position {
         let b = &self.books[l.book];
         let c = &b.chapters[l.chapter];
         let v = c.verses.get(l.verse).map(|v| v.verse).unwrap_or(1);
-        Position { book: b.nr, chapter: c.chapter, verse: v }
+        Position {
+            book: b.nr,
+            chapter: c.chapter,
+            verse: v,
+        }
     }
 
     pub fn reference(&self, l: Loc) -> String {
@@ -136,6 +180,13 @@ impl Translation {
     }
 
     pub fn verse_text(&self, l: Loc) -> Option<&str> {
+        if self
+            .online
+            .as_ref()
+            .is_some_and(|o| o.loaded != Some((l.book, l.chapter)) || o.error.is_some())
+        {
+            return None;
+        }
         self.books
             .get(l.book)?
             .chapters
@@ -165,7 +216,11 @@ impl Translation {
                     let lower = v.text.to_lowercase();
                     if terms.iter().all(|t| lower.contains(t.as_str())) {
                         hits.push(SearchHit {
-                            loc: Loc { book: bi, chapter: ci, verse: vi },
+                            loc: Loc {
+                                book: bi,
+                                chapter: ci,
+                                verse: vi,
+                            },
                             reference: format!("{} {}:{}", b.name, c.chapter, v.verse),
                             text: v.text.clone(),
                         });
@@ -185,12 +240,15 @@ impl Translation {
         if tokens.is_empty() {
             return None;
         }
-        let is_chapter_token =
-            |t: &str| t.chars().all(|c| c.is_ascii_digit() || c == ':' || c == '.' || c == '-');
+        let is_chapter_token = |t: &str| {
+            t.chars()
+                .all(|c| c.is_ascii_digit() || c == ':' || c == '.' || c == '-')
+        };
         let mut book_tokens: Vec<&str> = Vec::new();
         let mut rest: Vec<&str> = Vec::new();
         for (i, t) in tokens.iter().enumerate() {
-            let roman_prefix = i == 0 && matches!(t.to_ascii_uppercase().as_str(), "I" | "II" | "III");
+            let roman_prefix =
+                i == 0 && matches!(t.to_ascii_uppercase().as_str(), "I" | "II" | "III");
             let numeric_prefix = i == 0 && t.len() == 1 && t.chars().all(|c| c.is_ascii_digit());
             if rest.is_empty() && (roman_prefix || numeric_prefix || !is_chapter_token(t)) {
                 book_tokens.push(t);
@@ -220,7 +278,11 @@ impl Translation {
             .get(1)
             .and_then(|vn| c.verses.iter().position(|v| v.verse == *vn))
             .unwrap_or(0);
-        Some(Loc { book, chapter, verse })
+        Some(Loc {
+            book,
+            chapter,
+            verse,
+        })
     }
 
     pub fn find_book(&self, name: &str) -> Option<usize> {
@@ -366,8 +428,26 @@ fn catalog_path() -> PathBuf {
     data_dir().join("catalog.json")
 }
 
+fn valid_id(abbr: &str) -> bool {
+    !abbr.is_empty()
+        && abbr
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-')
+}
+
+fn checked_id(abbr: &str) -> io::Result<()> {
+    if valid_id(abbr) {
+        Ok(())
+    } else {
+        Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "Invalid translation ID",
+        ))
+    }
+}
+
 pub fn is_installed(abbr: &str) -> bool {
-    translation_path(abbr).exists()
+    valid_id(abbr) && translation_path(abbr).exists()
 }
 
 /// Translations available offline.
@@ -386,10 +466,10 @@ pub fn installed() -> Vec<TranslationInfo> {
         if !translation_path(abbr).exists() {
             continue;
         }
-        if let Ok(text) = fs::read_to_string(&path) {
-            if let Ok(info) = serde_json::from_str::<TranslationInfo>(&text) {
-                out.push(info);
-            }
+        if let Ok(text) = fs::read_to_string(&path)
+            && let Ok(info) = serde_json::from_str::<TranslationInfo>(&text)
+        {
+            out.push(info);
         }
     }
     out.sort_by(|a, b| a.abbreviation.cmp(&b.abbreviation));
@@ -397,9 +477,13 @@ pub fn installed() -> Vec<TranslationInfo> {
 }
 
 pub fn load(abbr: &str) -> io::Result<Translation> {
+    checked_id(abbr)?;
     let text = fs::read_to_string(translation_path(abbr))?;
     let mut t: Translation = serde_json::from_str(&text)
         .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e.to_string()))?;
+    t.validate(abbr)
+        .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
+    t.abbreviation = abbr.to_owned();
     for b in &mut t.books {
         for c in &mut b.chapters {
             for v in &mut c.verses {
@@ -416,6 +500,7 @@ pub fn load(abbr: &str) -> io::Result<Translation> {
 }
 
 pub fn remove(abbr: &str) -> io::Result<()> {
+    checked_id(abbr)?;
     let _ = fs::remove_file(meta_path(abbr));
     fs::remove_file(translation_path(abbr))
 }
@@ -423,7 +508,8 @@ pub fn remove(abbr: &str) -> io::Result<()> {
 fn write_meta(info: &TranslationInfo) -> io::Result<()> {
     fs::create_dir_all(translations_dir())?;
     let json = serde_json::to_string_pretty(info)?;
-    fs::write(meta_path(&info.abbreviation), json)
+    checked_id(&info.abbreviation)?;
+    crate::storage::atomic_write(&meta_path(&info.abbreviation), json.as_bytes())
 }
 
 pub fn cached_catalog() -> Vec<TranslationInfo> {
@@ -459,33 +545,48 @@ pub fn fetch_catalog() -> Result<Vec<TranslationInfo>, String> {
     let text = get_string(&format!("{API_BASE}/translations.json"))?;
     let map: HashMap<String, TranslationInfo> =
         serde_json::from_str(&text).map_err(|e| e.to_string())?;
-    let mut list: Vec<TranslationInfo> = map.into_values().collect();
+    let mut list: Vec<TranslationInfo> = map
+        .into_values()
+        .filter(|info| valid_id(&info.abbreviation))
+        .collect();
     list.sort_by(|a, b| {
-        (a.language.is_empty(), a.language.as_str(), a.translation.as_str())
-            .cmp(&(b.language.is_empty(), b.language.as_str(), b.translation.as_str()))
+        (
+            a.language.is_empty(),
+            a.language.as_str(),
+            a.translation.as_str(),
+        )
+            .cmp(&(
+                b.language.is_empty(),
+                b.language.as_str(),
+                b.translation.as_str(),
+            ))
     });
     let _ = fs::create_dir_all(data_dir());
     if let Ok(json) = serde_json::to_string(&list) {
-        let _ = fs::write(catalog_path(), json);
+        let _ = crate::storage::atomic_write(&catalog_path(), json.as_bytes());
     }
     Ok(list)
 }
 
 /// Download a whole translation into the local store and return it parsed.
 pub fn download(abbr: &str) -> Result<Translation, String> {
+    if crate::providers::is_online(abbr) {
+        return Err("Online translations cannot be downloaded; open with -t instead".into());
+    }
     let abbr = abbr.trim().to_lowercase();
-    if abbr.is_empty() || !abbr.chars().all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-') {
+    if abbr.is_empty()
+        || !abbr
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-')
+    {
         return Err(format!("invalid translation id '{abbr}'"));
     }
     let text = get_string(&format!("{API_BASE}/{abbr}.json"))?;
     let t: Translation = serde_json::from_str(&text).map_err(|e| e.to_string())?;
-    if t.books.is_empty() {
-        return Err("translation contains no books".into());
-    }
+    t.validate(&abbr)?;
     fs::create_dir_all(translations_dir()).map_err(|e| e.to_string())?;
-    let tmp = translation_path(&format!("{abbr}.tmp"));
-    fs::write(&tmp, &text).map_err(|e| e.to_string())?;
-    fs::rename(&tmp, translation_path(&abbr)).map_err(|e| e.to_string())?;
+    crate::storage::atomic_write(&translation_path(&abbr), text.as_bytes())
+        .map_err(|e| e.to_string())?;
     write_meta(&t.info()).map_err(|e| e.to_string())?;
     load(&abbr).map_err(|e| e.to_string())
 }
@@ -502,12 +603,16 @@ mod tests {
                 .map(|c| Chapter {
                     chapter: c,
                     verses: (1..=verses)
-                        .map(|v| Verse { verse: v, text: format!("{name} {c}:{v} text") })
+                        .map(|v| Verse {
+                            verse: v,
+                            text: format!("{name} {c}:{v} text"),
+                        })
                         .collect(),
                 })
                 .collect(),
         };
         Translation {
+            online: None,
             translation: "Test".into(),
             abbreviation: "test".into(),
             lang: "en".into(),
@@ -534,6 +639,26 @@ mod tests {
             let p = t.position_from_loc(l);
             (p.book, p.chapter, p.verse)
         })
+    }
+
+    #[test]
+    fn malformed_translation_structures_are_rejected_before_navigation() {
+        let good = sample();
+        good.validate(&good.abbreviation).unwrap();
+        for case in 0..6 {
+            let mut bad = good.clone();
+            match case {
+                0 => bad.books.clear(),
+                1 => bad.books[0].chapters.clear(),
+                2 => bad.books[0].chapters[0].verses.clear(),
+                3 => bad.books[1].nr = bad.books[0].nr,
+                4 => bad.books[0].chapters[0].verses[1].verse = 1,
+                _ => bad.abbreviation = "../outside".into(),
+            }
+            assert!(bad.validate(&good.abbreviation).is_err());
+        }
+        assert!(load("../outside").is_err());
+        assert!(remove("../outside").is_err());
     }
 
     #[test]

@@ -13,13 +13,14 @@ SHELL_JSON="$HOME/.config/omarchy/shell.json"
 
 rm -f "$HOME/.local/bin/omascripture"
 rm -f "$HOME/.local/share/applications/OmaScripture.desktop"
+rm -f "$HOME/.local/share/applications/io.github.zachwilke.OmaScripture.desktop"
 rm -f "$HOME/.local/share/icons/hicolor/scalable/apps/omascripture.svg"
 
 if [[ -f "$MENU_FILE" ]]; then
   sed -i '/"learn\.bible"/d' "$MENU_FILE"
 fi
 if [[ -f "$BINDINGS_FILE" ]]; then
-  sed -i '/-- OmaScripture (added by install.sh)/d; /tui = "omascripture"/d' "$BINDINGS_FILE"
+  sed -i '/-- OmaScripture (added by install.sh)/d; /tui = "omascripture"/d; /launch = "omascripture"/d' "$BINDINGS_FILE"
   command -v hyprctl >/dev/null 2>&1 && hyprctl reload >/dev/null 2>&1 || true
 fi
 if [[ -f "$SHELL_JSON" ]] && command -v python3 >/dev/null 2>&1 && grep -q omascripture.votd "$SHELL_JSON"; then
