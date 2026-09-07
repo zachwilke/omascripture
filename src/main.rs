@@ -242,15 +242,15 @@ fn main() {
     };
 
     let mut app = App::new();
-    app.start(translation, reference);
-
     if !tui {
+        app.start_gui(translation, reference);
         if let Err(e) = gui::run(app) {
             eprintln!("Could not open OmaScripture: {e}");
             std::process::exit(1);
         }
         return;
     }
+    app.start(translation, reference);
 
     let mut terminal = ratatui::init();
     let _ = crossterm::execute!(std::io::stdout(), EnableMouseCapture);

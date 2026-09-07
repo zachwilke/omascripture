@@ -38,6 +38,9 @@ pub struct Study {
     /// Primary translation abbreviation.
     #[serde(default)]
     pub translation: Option<String>,
+    /// None migrates existing users with a saved Bible without showing setup.
+    #[serde(default)]
+    pub onboarding_complete: Option<bool>,
     /// Parallel translation abbreviation.
     #[serde(default)]
     pub parallel: Option<String>,

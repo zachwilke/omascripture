@@ -167,6 +167,7 @@ pub struct HarmonyItem {
 }
 
 pub struct App {
+    pub onboarding: bool,
     pub mode: Mode,
     pub translation: Option<Translation>,
     pub parallel: Option<Translation>,
@@ -251,6 +252,7 @@ impl App {
         let (tx, rx) = mpsc::channel();
         let study = Study::load();
         App {
+            onboarding: false,
             mode: Mode::Read,
             translation: None,
             parallel: None,
@@ -312,6 +314,45 @@ impl App {
             chapter_pending: [false; 2],
             tx,
             rx,
+        }
+    }
+
+    /// Restore state from disk and honour command-line overrides.
+    pub fn start_gui(&mut self, translation_override: Option<String>, reference: Option<String>) {
+        if translation_override.is_none()
+            && !self.study.onboarding_complete.unwrap_or(self.study.translation.is_some()) {
+            self.onboarding = true;
+            self.study.onboarding_complete = Some(false);
+            self.pending_reference = reference;
+        } else {
+            self.start(translation_override, reference);
+        }
+    }
+
+    pub fn choose_initial_translation(&mut self, id: &str) {
+        self.status = None;
+        self.mode = Mode::Read;
+        if bible::is_installed(id) || providers::is_online(id) {
+            self.busy = Some(format!("Opening {}…", id.to_uppercase()));
+            self.spawn_load(id.into(), Slot::Primary);
+        } else {
+            self.spawn_download(id.into(), Slot::Primary);
+        }
+    }
+
+    pub fn finish_onboarding(&mut self) -> bool {
+        let Some(t) = &self.translation else { return false };
+        if t.online.as_ref().is_some_and(|online| online.error.is_some()
+            || online.loaded != Some((self.loc.book, self.loc.chapter))) {
+            return false;
+        }
+        self.study.onboarding_complete = Some(true);
+        if self.save() {
+            self.onboarding = false;
+            true
+        } else {
+            self.study.onboarding_complete = Some(false);
+            false
         }
     }
 
@@ -2649,6 +2690,67 @@ pub fn parse_tsk(raw: &str, here: Position) -> Vec<(Position, String)> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn first_gui_launch_waits_for_a_choice_and_preserves_reference() {
+        let dir = crate::storage::TestDir::new();
+        let mut app = App::new();
+        app.study = Study::load_from(dir.0.join("study.json"));
+        app.start_gui(None, Some("John 3:16".into()));
+        assert!(app.onboarding);
+        assert!(app.load_pending.iter().all(Option::is_none));
+        assert!(app.study.translation.is_none());
+        assert_eq!(app.pending_reference.as_deref(), Some("John 3:16"));
+        assert!(!app.finish_onboarding());
+    }
+
+    #[test]
+    fn existing_users_skip_setup_but_incomplete_setup_resumes() {
+        let dir = crate::storage::TestDir::new();
+        let path = dir.0.join("study.json");
+        std::fs::write(&path, r#"{"translation":"net"}"#).unwrap();
+        let mut app = App::new();
+        app.study = Study::load_from(path.clone());
+        app.catalog = providers::catalog();
+        app.start_gui(None, None);
+        assert!(!app.onboarding);
+        assert!(app.load_pending[0].is_some());
+
+        let mut resumed = App::new();
+        std::fs::write(&path, r#"{"translation":"net","onboarding_complete":false}"#).unwrap();
+        resumed.study = Study::load_from(path);
+        resumed.start_gui(None, None);
+        assert!(resumed.onboarding);
+        assert!(resumed.load_pending[0].is_none());
+    }
+
+    #[test]
+    fn onboarding_requires_loaded_text_and_a_successful_save() {
+        let dir = crate::storage::TestDir::new();
+        let path = dir.0.join("study.json");
+        let mut app = App::new();
+        app.study = Study::load_from(path.clone());
+        app.start_gui(None, None);
+        app.translation = Some(providers::open("net").unwrap());
+        assert!(!app.finish_onboarding());
+        let online = app.translation.as_mut().unwrap().online.as_mut().unwrap();
+        online.loaded = Some((0, 0));
+        online.error = Some("Connection failed".into());
+        assert!(!app.finish_onboarding());
+        app.translation.as_mut().unwrap().online = None;
+        app.study.translation = Some("net".into());
+        std::fs::write(&path, "external edits").unwrap();
+        assert!(!app.finish_onboarding());
+        assert!(app.onboarding);
+        assert_eq!(app.study.onboarding_complete, Some(false));
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "external edits");
+        std::fs::remove_file(&path).unwrap();
+        assert!(app.finish_onboarding());
+        assert!(!app.onboarding);
+        let saved = Study::load_from(path);
+        assert_eq!(saved.onboarding_complete, Some(true));
+        assert_eq!(saved.translation.as_deref(), Some("net"));
+    }
 
     #[test]
     fn stale_load_results_and_canceled_parallel_loads_are_discarded() {

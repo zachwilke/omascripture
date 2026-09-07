@@ -4,17 +4,19 @@
 
 set -euo pipefail
 
+INSTALL_ROOT="${OMASCRIPTURE_INSTALL_ROOT:-$HOME}"
 PURGE=0
 [[ "${1:-}" == "--purge" ]] && PURGE=1
 
-MENU_FILE="$HOME/.config/omarchy/extensions/omarchy-menu.jsonc"
-BINDINGS_FILE="$HOME/.config/hypr/bindings.lua"
-SHELL_JSON="$HOME/.config/omarchy/shell.json"
+MENU_FILE="$INSTALL_ROOT/.config/omarchy/extensions/omarchy-menu.jsonc"
+BINDINGS_FILE="$INSTALL_ROOT/.config/hypr/bindings.lua"
+SHELL_JSON="$INSTALL_ROOT/.config/omarchy/shell.json"
 
-rm -f "$HOME/.local/bin/omascripture"
-rm -f "$HOME/.local/share/applications/OmaScripture.desktop"
-rm -f "$HOME/.local/share/applications/io.github.zachwilke.OmaScripture.desktop"
-rm -f "$HOME/.local/share/icons/hicolor/scalable/apps/omascripture.svg"
+rm -f "$INSTALL_ROOT/.local/bin/omascripture"
+rm -f "$INSTALL_ROOT/.local/share/omascripture/uninstall.sh"
+rm -f "$INSTALL_ROOT/.local/share/applications/OmaScripture.desktop"
+rm -f "$INSTALL_ROOT/.local/share/applications/io.github.zachwilke.OmaScripture.desktop"
+rm -f "$INSTALL_ROOT/.local/share/icons/hicolor/scalable/apps/omascripture.svg"
 
 if [[ -f "$MENU_FILE" ]]; then
   sed -i '/"learn\.bible"/d' "$MENU_FILE"
@@ -40,8 +42,8 @@ PY
 fi
 
 if [[ $PURGE -eq 1 ]]; then
-  rm -rf "${XDG_DATA_HOME:-$HOME/.local/share}/omascripture"
+  rm -rf "${XDG_DATA_HOME:-$INSTALL_ROOT/.local/share}/omascripture"
   echo "Removed OmaScripture and all its data."
 else
-  echo "Removed OmaScripture. Your data is still in ${XDG_DATA_HOME:-$HOME/.local/share}/omascripture (use --purge to delete it)."
+  echo "Removed OmaScripture. Your data is still in ${XDG_DATA_HOME:-$INSTALL_ROOT/.local/share}/omascripture (use --purge to delete it)."
 fi

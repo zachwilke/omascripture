@@ -8,6 +8,9 @@
 #   ./install.sh --bar               add a verse-of-the-day widget to the Omarchy bar
 #   ./install.sh --bind "SUPER + SHIFT + ALT + B"   add a Hyprland keybinding
 #   ./install.sh --no-menu           skip the Omarchy menu entry
+#   ./install.sh --binary PATH       install a prebuilt app instead of building
+#   ./install.sh --launch            open the app after installation
+#   ./install.sh --no-launch         install without opening the app (default)
 #
 # Everything goes under ~/.local and ~/.config; nothing in /usr/share/omarchy is touched.
 
@@ -18,42 +21,59 @@ TRANSLATION=""
 STUDY=""
 ADD_MENU=1
 ADD_BAR=0
+BINARY=""
+LAUNCH=0
+INSTALL_ROOT="${OMASCRIPTURE_INSTALL_ROOT:-$HOME}"
 
 while [[ $# -gt 0 ]]; do
   case "$1" in
-    --bind) BIND="$2"; shift 2 ;;
-    --translation|-t) TRANSLATION="$2"; shift 2 ;;
-    --study) STUDY="$2"; shift 2 ;;
+    --binary) BINARY="${2:?--binary needs a path}"; shift 2 ;;
+    --launch) LAUNCH=1; shift ;;
+    --no-launch) LAUNCH=0; shift ;;
+    --bind) BIND="${2:?--bind needs a shortcut}"; shift 2 ;;
+    --translation|-t) TRANSLATION="${2:?--translation needs a Bible ID}"; shift 2 ;;
+    --study) STUDY="${2:?--study needs a pack selection}"; shift 2 ;;
     --bar) ADD_BAR=1; shift ;;
     --no-menu) ADD_MENU=0; shift ;;
-    -h|--help) sed -n '2,12p' "$0"; exit 0 ;;
+    -h|--help) sed -n '2,15p' "$0"; exit 0 ;;
     *) echo "unknown option: $1" >&2; exit 2 ;;
   esac
 done
 
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-BIN_DIR="$HOME/.local/bin"
+BIN_DIR="$INSTALL_ROOT/.local/bin"
 BIN="$BIN_DIR/omascripture"
-APP_DIR="$HOME/.local/share/applications"
-ICON_DIR="$HOME/.local/share/icons/hicolor/scalable/apps"
-MENU_FILE="$HOME/.config/omarchy/extensions/omarchy-menu.jsonc"
-BINDINGS_FILE="$HOME/.config/hypr/bindings.lua"
-SHELL_JSON="$HOME/.config/omarchy/shell.json"
+APP_DIR="$INSTALL_ROOT/.local/share/applications"
+ICON_DIR="$INSTALL_ROOT/.local/share/icons/hicolor/scalable/apps"
+MENU_FILE="$INSTALL_ROOT/.config/omarchy/extensions/omarchy-menu.jsonc"
+BINDINGS_FILE="$INSTALL_ROOT/.config/hypr/bindings.lua"
+SHELL_JSON="$INSTALL_ROOT/.config/omarchy/shell.json"
 SHELL_DEFAULT="${OMARCHY_PATH:-/usr/share/omarchy}/config/omarchy/shell.json"
 APP_ID="io.github.zachwilke.OmaScripture"
 
-if ! command -v cargo >/dev/null 2>&1; then
-  echo "cargo is required. Install a Rust toolchain first, e.g.:  omarchy install dev-env rust" >&2
+if [[ -z "$BINARY" ]]; then
+  if ! command -v cargo >/dev/null 2>&1; then
+    echo "For installation without Rust, use the quick installer in README.md." >&2
+    exit 1
+  fi
+  echo "==> Building release binary"
+  (cd "$HERE" && cargo build --locked --release --quiet)
+  BINARY="$HERE/target/release/omascripture"
+fi
+if [[ ! -x "$BINARY" ]]; then
+  echo "Cannot run the supplied OmaScripture binary: $BINARY" >&2
   exit 1
 fi
-
-echo "==> Building release binary"
-(cd "$HERE" && cargo build --release --quiet)
+# Detect missing runtime libraries before replacing a working installation.
+"$BINARY" --version
 
 echo "==> Installing binary to $BIN"
 mkdir -p "$BIN_DIR"
-install -m 755 "$HERE/target/release/omascripture" "$BIN.next"
+install -m 755 "$BINARY" "$BIN.next"
 mv -f "$BIN.next" "$BIN"
+
+mkdir -p "$INSTALL_ROOT/.local/share/omascripture"
+install -m 755 "$HERE/uninstall.sh" "$INSTALL_ROOT/.local/share/omascripture/uninstall.sh"
 
 echo "==> Installing icon"
 mkdir -p "$ICON_DIR"
@@ -62,12 +82,18 @@ install -m 644 "$HERE/assets/omascripture.svg" "$ICON_DIR/omascripture.svg"
 echo "==> Installing desktop entry"
 mkdir -p "$APP_DIR"
 rm -f "$APP_DIR/OmaScripture.desktop"
+# Desktop Entry quoting (including literal percent signs in user paths).
+EXEC_PATH="${BIN//\\/\\\\}"
+EXEC_PATH="${EXEC_PATH//\"/\\\"}"
+EXEC_PATH="${EXEC_PATH//\$/\\\$}"
+EXEC_PATH="${EXEC_PATH//\`/\\\`}"
+EXEC_PATH="${EXEC_PATH//%/%%}"
 cat > "$APP_DIR/$APP_ID.desktop" <<EOF
 [Desktop Entry]
 Version=1.0
 Name=OmaScripture
 Comment=Read and study the Bible: translations, interlinear, commentaries, dictionaries
-Exec=$BIN --gui
+Exec="$EXEC_PATH" --gui
 Terminal=false
 Type=Application
 Icon=omascripture
@@ -77,9 +103,9 @@ StartupNotify=true
 StartupWMClass=$APP_ID
 EOF
 command -v update-desktop-database >/dev/null 2>&1 && update-desktop-database "$APP_DIR" 2>/dev/null || true
-command -v gtk-update-icon-cache >/dev/null 2>&1 && gtk-update-icon-cache -q "$HOME/.local/share/icons/hicolor" 2>/dev/null || true
+command -v gtk-update-icon-cache >/dev/null 2>&1 && gtk-update-icon-cache -q "$INSTALL_ROOT/.local/share/icons/hicolor" 2>/dev/null || true
 
-if [[ $ADD_MENU -eq 1 ]]; then
+if [[ $ADD_MENU -eq 1 ]] && command -v omarchy >/dev/null 2>&1; then
   echo "==> Adding Omarchy menu entry (Learn → Bible)"
   mkdir -p "$(dirname "$MENU_FILE")"
   if [[ ! -f "$MENU_FILE" ]]; then
@@ -182,16 +208,19 @@ esac
 
 cat <<EOF
 
-Done. Launch OmaScripture with any of:
-  omascripture                       (desktop app)
-  omascripture "John 3:16"           (open at a reference)
-  omascripture --tui                 (optional terminal interface)
-  Super+Space → Learn → Bible        (Omarchy menu)
-  App launcher → OmaScripture
+Installed. Open OmaScripture from your app launcher, or run:
+  "$BIN"
 
-Use the book navigator, Study sidebar, and Settings to make it your own.
+Choose your default Bible on first launch. You can change it later in Settings.
+Uninstall: bash "$INSTALL_ROOT/.local/share/omascripture/uninstall.sh"
 EOF
 if ! echo "$PATH" | tr ':' '\n' | grep -qx "$BIN_DIR"; then
   echo
-  echo "Note: $BIN_DIR is not on your PATH; the desktop entry and menu still work, but add it for terminal use."
+  echo "Note: $BIN_DIR is not on your PATH; the desktop entry still works, but add it for terminal use."
+fi
+
+if [[ $LAUNCH -eq 1 && ( -n "${WAYLAND_DISPLAY:-}" || -n "${DISPLAY:-}" ) ]]; then
+  echo "Opening OmaScripture…"
+  mkdir -p "$INSTALL_ROOT/.local/state/omascripture"
+  nohup "$BIN" --gui >"$INSTALL_ROOT/.local/state/omascripture/launch.log" 2>&1 </dev/null &
 fi

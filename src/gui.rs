@@ -170,6 +170,9 @@ fn theme(ctx: &egui::Context, colors: Palette) {
 }
 
 struct Desktop {
+    onboarding_selection: String,
+    onboarding_waiting: bool,
+    onboarding_filter: String,
     app: App,
     colors: Palette,
     theme_source: ThemeSource,
@@ -198,6 +201,13 @@ impl Desktop {
         let mut theme_source = ThemeSource::new();
         let colors = theme_source.resolve(&app.study.gui_theme, app.study.gui_light);
         Self {
+            onboarding_selection: app
+                .study
+                .translation
+                .clone()
+                .unwrap_or_else(|| "web".into()),
+            onboarding_waiting: false,
+            onboarding_filter: String::new(),
             app,
             colors,
             theme_source,
@@ -268,7 +278,7 @@ impl Desktop {
             self.colors = colors;
             theme(ctx, colors);
         }
-        if self.app.mode == Mode::Read {
+        if self.app.mode == Mode::Read && !self.app.onboarding {
             if ctx.input_mut(|i| i.consume_key(egui::Modifiers::COMMAND, egui::Key::F)) {
                 self.command('/');
             }
@@ -310,6 +320,15 @@ impl Desktop {
                     ctx.send_viewport_cmd(egui::ViewportCommand::Close);
                 }
             });
+        }
+        if self.app.onboarding {
+            egui::CentralPanel::default().show(ctx, |ui| self.onboarding(ui));
+            ctx.request_repaint_after(if self.app.background_work_pending() {
+                Duration::from_millis(150)
+            } else {
+                Duration::from_secs(1)
+            });
+            return;
         }
         egui::TopBottomPanel::top("header")
             .frame(
@@ -437,6 +456,96 @@ impl Desktop {
                 self.app.should_quit = false;
             }
         }
+    }
+
+    fn onboarding(&mut self, ui: &mut egui::Ui) {
+        let ready = self.app.translation.as_ref().is_some_and(|t| {
+            t.abbreviation == self.onboarding_selection
+                && t.online.as_ref().is_none_or(|o| {
+                    o.error.is_none() && o.loaded == Some((self.app.loc.book, self.app.loc.chapter))
+                })
+        });
+        if self.onboarding_waiting && ready {
+            self.onboarding_waiting = false;
+            if self.app.finish_onboarding() {
+                ui.ctx().request_repaint();
+                return;
+            }
+        }
+        if !self.app.background_work_pending() {
+            self.onboarding_waiting = false;
+        }
+        ScrollArea::vertical().show(ui, |ui| {
+            ui.vertical_centered(|ui| {
+                ui.set_max_width(640.0);
+                ui.add_space(28.0);
+                ui.label(RichText::new("Welcome to OmaScripture").size(30.0).color(self.colors.accent));
+                ui.add_space(8.0);
+                ui.heading("Choose your default Bible");
+                ui.label("Make yourself at home. You can change this anytime in Settings.");
+                ui.add_space(18.0);
+                ui.add_enabled_ui(!self.onboarding_waiting, |ui| {
+                    for (id, name, description) in [
+                        ("web", "World English Bible", "Modern English · download once, read offline"),
+                        ("kjv", "King James Version", "Classic English · offline reading and linked word studies"),
+                        ("net", "NET Bible", "Modern English · reads online, internet required"),
+                        ("nlt", "New Living Translation", "Easy-to-read English · reads online, internet required"),
+                    ] {
+                        let detail = if crate::bible::is_installed(id) { "Already downloaded · available offline" } else { description };
+                        if ui.add(egui::Button::new(format!("{name}\n{detail}"))
+                            .selected(self.onboarding_selection == id)
+                            .min_size(egui::vec2(ui.available_width(), 60.0))).clicked() {
+                            self.onboarding_selection = id.into();
+                        }
+                    }
+                    ui.collapsing("More translations", |ui| {
+                        if self.app.catalog.is_empty() {
+                            ui.label("Load the catalog to choose another offline edition or language.");
+                            if ui.add_enabled(!self.app.background_work_pending(), egui::Button::new("Load translation list")).clicked() {
+                                self.app.refresh_catalog();
+                            }
+                        } else {
+                            ui.add(egui::TextEdit::singleline(&mut self.onboarding_filter).hint_text("Find a Bible or language…"));
+                            let filter = self.onboarding_filter.to_lowercase();
+                            let mut found = false;
+                            ScrollArea::vertical().max_height(160.0).show(ui, |ui| {
+                                for edition in &self.app.catalog {
+                                    if providers::is_online(&edition.abbreviation) { continue; }
+                                    let label = format!("{} · {}", edition.translation, edition.language);
+                                    if !filter.is_empty() && !label.to_lowercase().contains(&filter)
+                                        && !edition.abbreviation.to_lowercase().contains(&filter) { continue; }
+                                    found = true;
+                                    ui.selectable_value(&mut self.onboarding_selection, edition.abbreviation.clone(), label);
+                                }
+                            });
+                            if !found { ui.label("No matches. Try another name or language."); }
+                        }
+                        ui.small("Editions that need a provider key can be added in Settings after setup.");
+                    });
+                });
+                ui.add_space(16.0);
+                if self.onboarding_waiting {
+                    ui.spinner();
+                    ui.label(self.app.busy.as_deref().unwrap_or("Preparing your Bible…"));
+                } else if ui.add_sized([240.0, 44.0], egui::Button::new("Start reading")).clicked() {
+                    if ready {
+                        if self.app.finish_onboarding() { ui.ctx().request_repaint(); }
+                    } else {
+                        self.app.choose_initial_translation(&self.onboarding_selection);
+                        self.onboarding_waiting = true;
+                    }
+                }
+                if let Some(error) = self.app.translation.as_ref().and_then(|t| t.online.as_ref()).and_then(|o| o.error.as_deref()) {
+                    ui.colored_label(self.colors.red, error);
+                    ui.label("Choose Start reading to retry, or select another Bible.");
+                } else if let Some(status) = self.app.status_text() {
+                    ui.label(status);
+                }
+                ui.add_space(12.0);
+                ui.small("Study resources are optional. Add them later from Resources.");
+                ui.add_space(20.0);
+            });
+        });
     }
 
     fn navigation(&mut self, ui: &mut egui::Ui) {
@@ -1879,6 +1988,30 @@ impl eframe::App for Desktop {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn welcome_choice_starts_reading_and_saves_the_default() {
+        let (mut desktop, ctx) = fixture();
+        let dir = crate::storage::TestDir::new();
+        let path = dir.0.join("study.json");
+        desktop.app.study = crate::study::Study::load_from(path.clone());
+        desktop.app.onboarding = true;
+        desktop.app.study.onboarding_complete = Some(false);
+        desktop.app.study.translation = Some("kjv".into());
+        desktop.app.translation.as_mut().unwrap().abbreviation = "kjv".into();
+        let detail = if crate::bible::is_installed("kjv") {
+            "Already downloaded · available offline"
+        } else {
+            "Classic English · offline reading and linked word studies"
+        };
+        click(&mut desktop, &ctx, &format!("King James Version\n{detail}"));
+        assert_eq!(desktop.onboarding_selection, "kjv");
+        click(&mut desktop, &ctx, "Start reading");
+        assert!(!desktop.app.onboarding);
+        let saved = crate::study::Study::load_from(path);
+        assert_eq!(saved.translation.as_deref(), Some("kjv"));
+        assert_eq!(saved.onboarding_complete, Some(true));
+    }
 
     #[test]
     fn search_empty_states_keep_actions_available() {
