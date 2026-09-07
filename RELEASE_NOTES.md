@@ -1,18 +1,17 @@
-Install OmaScripture with one command, then choose your default Bible on first launch:
+OmaScripture now includes an About dialog with a personal signature and author links.
+
+- See “Made by Zach Wilke,” the app version, and links to GitHub @zachwilke and X @Zachwilke_1.
+- Open About from Settings, the reading footer, or the first-launch welcome screen.
+- Find the project source, releases, and license information in the same dialog.
+
+Install or update:
 
 ```bash
 curl -fsSL https://raw.githubusercontent.com/zachwilke/omascripture/main/setup.sh | bash
 ```
 
-- Prebuilt x86_64 Linux app: no Rust toolchain or sudo needed.
-- Download checksums are verified before installation.
-- First launch offers WEB, KJV, NET and NLT, plus the offline translation catalog.
-- Offline Bibles download once; online editions load chapters as you read.
-- Setup completes only after the Bible loads and your preference is saved.
-- Existing study files, notes and Bible choices are preserved on upgrades.
+The installer verifies the download and preserves your Bible choice, downloaded resources, notes, and preferences. No Rust toolchain or sudo required.
 
-Built on Ubuntu 24.04 for x86_64 Linux (glibc 2.39 or newer), tested on Omarchy.
-Requires a Wayland/X11 graphical session and working OpenGL drivers.
+Prebuilt for x86_64 Linux with glibc 2.39 or newer, a Wayland/X11 desktop, and OpenGL drivers.
 
-For installation without launching the app, append `-s -- --no-launch` to `bash`.
-Uninstall with `bash ~/.local/share/omascripture/uninstall.sh`; study data is kept.
+Validation: 62 automated tests passed, Clippy passed with warnings denied, installer regression checks passed, and the About dialog was visually checked on Omarchy.

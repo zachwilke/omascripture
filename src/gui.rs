@@ -173,6 +173,7 @@ struct Desktop {
     onboarding_selection: String,
     onboarding_waiting: bool,
     onboarding_filter: String,
+    show_about: bool,
     app: App,
     colors: Palette,
     theme_source: ThemeSource,
@@ -208,6 +209,7 @@ impl Desktop {
                 .unwrap_or_else(|| "web".into()),
             onboarding_waiting: false,
             onboarding_filter: String::new(),
+            show_about: false,
             app,
             colors,
             theme_source,
@@ -323,6 +325,7 @@ impl Desktop {
         }
         if self.app.onboarding {
             egui::CentralPanel::default().show(ctx, |ui| self.onboarding(ui));
+            self.about(ctx);
             ctx.request_repaint_after(if self.app.background_work_pending() {
                 Duration::from_millis(150)
             } else {
@@ -407,6 +410,9 @@ impl Desktop {
                         );
                     }
                     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                        if ui.small_button("About").on_hover_text("Made by Zach Wilke").clicked() {
+                            self.show_about = true;
+                        }
                         if let Some(t) = &self.app.translation {
                             ui.label(
                                 RichText::new(format!(
@@ -440,6 +446,7 @@ impl Desktop {
             )
             .show(ctx, |ui| self.reading(ui));
         self.dialog(ctx);
+        self.about(ctx);
         // Input/animations still repaint immediately. Idle frames only service
         // theme changes and autosave; pending workers keep their short poll.
         ctx.request_repaint_after(
@@ -543,9 +550,50 @@ impl Desktop {
                 }
                 ui.add_space(12.0);
                 ui.small("Study resources are optional. Add them later from Resources.");
+                ui.add_space(12.0);
+                if ui.small_button("Made by Zach Wilke · About").clicked() {
+                    self.show_about = true;
+                }
                 ui.add_space(20.0);
             });
         });
+    }
+
+    fn about(&mut self, ctx: &egui::Context) {
+        if !self.show_about {
+            return;
+        }
+        let mut open = true;
+        let mut close = false;
+        egui::Window::new("About OmaScripture")
+            .open(&mut open)
+            .collapsible(false)
+            .resizable(false)
+            .anchor(egui::Align2::CENTER_CENTER, egui::Vec2::ZERO)
+            .default_width(380.0)
+            .show(ctx, |ui| {
+                ui.vertical_centered(|ui| {
+                    ui.add_space(12.0);
+                    ui.label(RichText::new("OmaScripture").size(28.0).strong().color(self.colors.accent));
+                    ui.label(format!("Version {}", env!("CARGO_PKG_VERSION")));
+                    ui.add_space(12.0);
+                    ui.label("A little time in the Word.");
+                    ui.add_space(16.0);
+                    ui.label(RichText::new("Made by Zach Wilke").size(18.0).strong());
+                    ui.add_space(8.0);
+                    ui.hyperlink_to("GitHub · @zachwilke", "https://github.com/zachwilke");
+                    ui.hyperlink_to("X · @Zachwilke_1", "https://x.com/Zachwilke_1");
+                    ui.add_space(16.0);
+                    ui.separator();
+                    ui.hyperlink_to("Source code & releases", "https://github.com/zachwilke/omascripture");
+                    ui.small("Open source · MIT license");
+                    ui.small("Bible texts and study resources retain their own licenses.");
+                    ui.add_space(16.0);
+                    close = ui.button("Close").clicked();
+                    ui.add_space(8.0);
+                });
+            });
+        self.show_about = open && !close;
     }
 
     fn navigation(&mut self, ui: &mut egui::Ui) {
@@ -1808,6 +1856,10 @@ impl Desktop {
     }
 
     fn settings(&mut self, ui: &mut egui::Ui) {
+        if ui.button("About OmaScripture").clicked() {
+            self.show_about = true;
+        }
+        ui.add_space(8.0);
         ui.label(RichText::new("READING").strong().color(self.colors.accent));
         for (row, label) in [
             (Row::Translation, "Default Bible"),
